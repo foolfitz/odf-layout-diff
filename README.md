@@ -53,7 +53,7 @@ python3 -m unittest discover -s tests -t . -v
 
 ```json
 {
-  "reportVersion": 1,
+  "reportVersion": 2,
   "pages": {"reference": 2, "candidate": 2},
   "matchedGlyphRatio": 0.912,
   "rowsOnAnotherPage": [...],
@@ -78,7 +78,24 @@ python3 -m unittest discover -s tests -t . -v
     relative to `rowAbove`, and no reported block change explains it.
     `breaksInRowAbove` lists line breaks the candidate added inside
     `rowAbove` across block boundaries (for example, text pushed to the
-    right of a cell by spaces).
+    right of a cell by spaces). When it finds none, `extraRows` lists the
+    texts of candidate rows that appeared between the two rows without
+    holding text of another reference row, and `hint` is `wrapped-row` if
+    each of them is text of `rowAbove` (typically its last character wrapped
+    on its own, too short to align) or `unknown` otherwise.
+  - `shifted-line-start`: a line starts `shiftPt` points right (positive)
+    or left (negative) of the reference while staying on the row its
+    reference row landed on, so nothing wraps differently: an indent or
+    margin moved it, for example out of its table cell. Reported from 6 pt
+    on (about a cell's padding). Lines of one block moved by the same
+    amount form one symptom (`lineCount`); `hint` is always
+    `shifted-start`. A line start already given as a break's
+    `startShiftPt`, a later segment of the same paragraph (see `wide-gap`)
+    and centred text whose two ends moved apart are left out.
+- With `--projection`, every symptom kind carries `nodes`: for block
+  changes and shifts with breaks, matched from the block text and the text
+  around the breaks; for other shifts, from the lines of `rowAbove`; for
+  moved lines, from their block and line starts.
 - Each break has `textBeforeBreak`/`textAfterBreak` (normalized: NFKC, no
   whitespace), `startShiftPt` (how far right the candidate starts the text
   before the break; `null` unless that text begins a line, or a segment of
@@ -128,14 +145,19 @@ python3 -m unittest discover -s tests -t . -v
    the threshold, persists into the next row, and is not directly below a
    reported block. Rows repeated on several pages (running headers and
    footers) are ignored.
+6. A line start (the first character of a `pdftotext` line in both
+   renderings) whose candidate character sits on the row its reference row
+   landed on is compared horizontally.
 
 ## Limitations
 
-- Text only: ruling lines, cell borders and images are not compared.
+- Text only: ruling lines, cell borders and images are not compared. Text
+  moved out of its cell is found only as a line start that moved relative
+  to the reference, not against the border itself.
 - Both PDFs must contain the same text. A filled-in form compared with a
   blank one will report the filled-in values as differences.
 - The reference renderer matters. LibreOffice-based renderers (Collabora)
   share the candidate's layout engine and are not a useful reference.
-- Line breaks inside a single character run (for example a lone "日"
-  wrapped onto the next line) may be missed; the resulting shift is still
-  reported, without a cause.
+- Line breaks before text too short to align (for example a lone "日"
+  wrapped onto the next line) are not found as breaks; the resulting shift
+  is reported with the added row in `extraRows` instead.

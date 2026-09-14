@@ -25,7 +25,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
-REPORT_VERSION = 1
+REPORT_VERSION = 2
 XHTML = "{http://www.w3.org/1999/xhtml}"
 
 # Lines whose vertical centres are closer than this fraction of the smaller
@@ -47,6 +47,10 @@ BACK_LEFT_PT = 1.0
 SHIFTED_START_PT = 3.0
 WIDER_TEXT_RATIO = 1.005
 WIDE_GAP_PT = 20.0
+# A line that does not wrap differently is reported as moved sideways from
+# this distance on: about a table cell's default padding, so smaller shifts
+# keep the text inside its cell.
+LINE_START_SHIFT_PT = 6.0
 # A `pdftotext` line in the same block and row that starts no further right
 # than this past the end of the previous one continues it.
 LINE_JOIN_PT = 1.0
@@ -358,15 +362,21 @@ def starts_segment(layout: Layout, glyph: int) -> bool:
     return glyph == 0 or layout.glyphs[glyph - 1].segment != layout.glyphs[glyph].segment
 
 
-def segment_text(layout: Layout, glyph: int, step: int) -> str:
-    """Up to NODE_KEY_LENGTH characters of `glyph`'s segment, starting at it
-    (`step` 1) or ending at it (`step` -1)."""
+def segment_text(layout: Layout, glyph: int, step: int, limit: int = NODE_KEY_LENGTH) -> str:
+    """Up to `limit` characters of `glyph`'s segment, starting at it (`step`
+    1) or ending at it (`step` -1)."""
     segment = layout.glyphs[glyph].segment
     chars = []
-    while 0 <= glyph < len(layout.glyphs) and layout.glyphs[glyph].segment == segment and len(chars) < NODE_KEY_LENGTH:
+    while 0 <= glyph < len(layout.glyphs) and layout.glyphs[glyph].segment == segment and len(chars) < limit:
         chars.append(layout.glyphs[glyph].char)
         glyph += step
     return "".join(chars if step > 0 else reversed(chars))
+
+
+def segment_end(layout: Layout, glyph: int) -> int:
+    while glyph + 1 < len(layout.glyphs) and layout.glyphs[glyph + 1].segment == layout.glyphs[glyph].segment:
+        glyph += 1
+    return glyph
 
 
 def paragraph_neighbour(layout: Layout, glyph: int, nodes: list[dict]) -> int | None:
@@ -391,8 +401,10 @@ def describe_break(
     members: list[tuple[int, int]],
     index: int,
     nodes: list[dict],
+    reported_starts: set[int],
 ) -> dict:
-    """The break between `members[index]` and `members[index + 1]`."""
+    """The break between `members[index]` and `members[index + 1]`. A
+    reference glyph given a `startShiftPt` is added to `reported_starts`."""
     if kind == "added":
         row_of = lambda pair: candidate.row_of(pair[1])  # noqa: E731
         shared, shared_index = reference, 0
@@ -417,6 +429,7 @@ def describe_break(
         neighbour = paragraph_neighbour(reference, first, nodes)
         if neighbour is None:
             start_shift = shift
+            reported_starts.add(first)
         else:
             after_wider_gap = (
                 shift >= SHIFTED_START_PT
@@ -457,7 +470,11 @@ def without_reflow(breaks: list[dict]) -> list[dict]:
 
 
 def row_breaks(
-    reference: Layout, candidate: Layout, members: list[tuple[int, int]], nodes: list[dict]
+    reference: Layout,
+    candidate: Layout,
+    members: list[tuple[int, int]],
+    nodes: list[dict],
+    reported_starts: set[int],
 ) -> list[dict]:
     """Line breaks the candidate added inside one reference row, across
     whatever text blocks the row is made of."""
@@ -466,7 +483,7 @@ def row_breaks(
     for index in range(len(members) - 1):
         (_, b1), (_, b2) = members[index], members[index + 1]
         if candidate.row_of(b1) != candidate.row_of(b2) and candidate.is_new_line(b1, b2):
-            found.append(describe_break("added", reference, candidate, members, index, nodes))
+            found.append(describe_break("added", reference, candidate, members, index, nodes, reported_starts))
     return without_reflow(found)
 
 
@@ -478,7 +495,13 @@ def break_keys(breaks: list[dict]) -> list[str]:
     return keys
 
 
-def block_changes(reference: Layout, candidate: Layout, pairs: list[tuple[int, int]], nodes: list[dict]) -> list[dict]:
+def block_changes(
+    reference: Layout,
+    candidate: Layout,
+    pairs: list[tuple[int, int]],
+    nodes: list[dict],
+    reported_starts: set[int],
+) -> list[dict]:
     """Reference text blocks whose matched text spans a different number of
     lines in the candidate."""
     by_block: dict[int, list[tuple[int, int]]] = defaultdict(list)
@@ -498,10 +521,14 @@ def block_changes(reference: Layout, candidate: Layout, pairs: list[tuple[int, i
             same_candidate_row = candidate.row_of(b1) == candidate.row_of(b2)
             if same_reference_row and not same_candidate_row and candidate.is_new_line(b1, b2):
                 if {candidate.row_of(b1), candidate.row_of(b2)} <= candidate_rows:
-                    breaks.append(describe_break("added", reference, candidate, members, index, nodes))
+                    breaks.append(
+                        describe_break("added", reference, candidate, members, index, nodes, reported_starts)
+                    )
             elif same_candidate_row and not same_reference_row and reference.is_new_line(a1, a2):
                 if {reference.row_of(a1), reference.row_of(a2)} <= reference_rows:
-                    breaks.append(describe_break("removed", reference, candidate, members, index, nodes))
+                    breaks.append(
+                        describe_break("removed", reference, candidate, members, index, nodes, reported_starts)
+                    )
         # Counting breaks rather than rows keeps a block that holds several
         # side-by-side cells from reporting their mutual misalignment.
         line_change = sum(1 if item["kind"] == "added" else -1 for item in breaks)
@@ -514,7 +541,7 @@ def block_changes(reference: Layout, candidate: Layout, pairs: list[tuple[int, i
             "kind": "text-block-taller" if line_change > 0 else "text-block-shorter",
             "page": first_line.page,
             "y": round(first_line.center, 1),
-            "text": shorten(" ".join(line.text for line in block_lines)),
+            "text": block_text(reference, block),
             "lineChange": line_change,
             "breakCount": len(breaks),
             "heightChangePt": round(
@@ -529,6 +556,100 @@ def block_changes(reference: Layout, candidate: Layout, pairs: list[tuple[int, i
             change["nodes"] = match_nodes(nodes, keys + break_keys(breaks))
         changes.append({"impact": abs(change["heightChangePt"]), "rows": reference_rows, "symptom": change})
     return changes
+
+
+def block_text(layout: Layout, block: int) -> str:
+    return shorten(" ".join(line.text for line in layout.lines if line.block == block))
+
+
+def row_keys(layout: Layout, row: int) -> list[str]:
+    """Node keys for a row: the start and end of each of its lines."""
+    keys = []
+    for index in layout.rows[row].lines:
+        text = normalize(layout.lines[index].text)
+        keys += [text[:NODE_KEY_LENGTH], text[-NODE_KEY_LENGTH:]]
+    return keys
+
+
+def extra_rows(
+    reference: Layout,
+    candidate: Layout,
+    pairs_by_candidate_row: dict[int, list[tuple[int, int]]],
+    upper: int,
+    lower: int,
+    target_of: dict[int, int],
+) -> list[str]:
+    """Texts of candidate rows between where reference rows `upper` and
+    `lower` landed that hold no text of another reference row: lines the
+    candidate added, such as the last character of `upper` wrapped on its
+    own (too short to align, so no break is found)."""
+    between = {
+        normalize("".join(reference.lines[index].text for index in reference.rows[row].lines))
+        for row in range(upper + 1, lower)
+    }
+    found = []
+    for row in range(target_of[upper] + 1, target_of[lower]):
+        if {reference.row_of(a) for a, _ in pairs_by_candidate_row[row]} - {upper}:
+            continue
+        text = normalize("".join(candidate.lines[index].text for index in candidate.rows[row].lines))
+        if text not in between:
+            found.append(candidate.row_text(row))
+    return found
+
+
+def line_start_shifts(
+    reference: Layout,
+    candidate: Layout,
+    pairs: list[tuple[int, int]],
+    nodes: list[dict],
+    reported_starts: set[int],
+    target_of: dict[int, int],
+) -> list[dict]:
+    """Lines that start at another x in the candidate while staying on the
+    row their reference row landed on: an indent or margin change that moves
+    text without wrapping it, for example out of its table cell. Consecutive
+    lines of one block moved by the same amount form one symptom."""
+    partner = dict(pairs)
+    groups: list[dict] = []
+    for a, b in pairs:
+        if a in reported_starts or not (starts_segment(reference, a) and starts_segment(candidate, b)):
+            continue
+        if target_of.get(reference.row_of(a)) != candidate.row_of(b):
+            continue
+        shift = candidate.glyphs[b].x - reference.glyphs[a].x
+        if abs(shift) < LINE_START_SHIFT_PT or paragraph_neighbour(reference, a, nodes) is not None:
+            continue
+        end = segment_end(reference, a)
+        end_partner = partner.get(end)
+        if end_partner is not None and candidate.glyphs[end_partner].segment == candidate.glyphs[b].segment:
+            end_shift = candidate.glyphs[end_partner].x - reference.glyphs[end].x
+            # Centred text that got wider or narrower moves both ends apart.
+            if shift * end_shift < 0 and abs(shift + end_shift) <= LINE_JOIN_PT:
+                continue
+        block = reference.line_of(a).block
+        same = [group for group in groups if group["block"] == block and abs(shift - group["shift"]) <= LINE_JOIN_PT]
+        if same:
+            same[0]["glyphs"].append(a)
+        else:
+            groups.append({"block": block, "shift": shift, "glyphs": [a]})
+    found = []
+    for group in groups:
+        first = group["glyphs"][0]
+        line = reference.line_of(first)
+        symptom = {
+            "kind": "shifted-line-start",
+            "page": line.page,
+            "y": round(line.center, 1),
+            "text": shorten(segment_text(reference, first, 1, TEXT_LIMIT)),
+            "lineCount": len(group["glyphs"]),
+            "shiftPt": round(group["shift"], 1),
+            "hint": "shifted-start",
+        }
+        if nodes:
+            keys = [normalize(block_text(reference, group["block"]))[:NODE_KEY_LENGTH]]
+            symptom["nodes"] = match_nodes(nodes, keys + [segment_text(reference, g, 1) for g in group["glyphs"]])
+        found.append({"impact": abs(group["shift"]), "rows": set(), "symptom": symptom})
+    return found
 
 
 def row_positions(reference: Layout, candidate: Layout, pairs: list[tuple[int, int]]) -> list[dict]:
@@ -563,6 +684,7 @@ def row_positions(reference: Layout, candidate: Layout, pairs: list[tuple[int, i
                 "row": row,
                 "page": source.page,
                 "anchor": source.anchor,
+                "candidateRow": target,
                 "candidatePage": candidate.rows[target].page,
                 "shift": statistics.median(
                     candidate.absolute_center(b) - reference.absolute_center(a)
@@ -585,12 +707,16 @@ def compare(
     nodes = nodes or []
     pairs = align(reference, candidate)
     pairs_by_row: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    pairs_by_candidate_row: dict[int, list[tuple[int, int]]] = defaultdict(list)
     for pair in pairs:
         pairs_by_row[reference.row_of(pair[0])].append(pair)
-    found = block_changes(reference, candidate, pairs, nodes)
+        pairs_by_candidate_row[candidate.row_of(pair[1])].append(pair)
+    reported_starts: set[int] = set()
+    found = block_changes(reference, candidate, pairs, nodes, reported_starts)
     explained_rows = set().union(*(item["rows"] for item in found)) if found else set()
 
     positions = row_positions(reference, candidate, pairs)
+    target_of = {position["row"]: position["candidateRow"] for position in positions}
     moved: dict[tuple[int, int], list[int]] = defaultdict(list)
     kept = [position for position in positions if position["candidatePage"] == position["page"]]
     for position in positions:
@@ -609,7 +735,7 @@ def compare(
         if following is not None and following["page"] == current["page"]:
             if abs(following["shift"] - previous["shift"]) < threshold:
                 continue
-        causes = row_breaks(reference, candidate, pairs_by_row[previous["row"]], nodes)
+        causes = row_breaks(reference, candidate, pairs_by_row[previous["row"]], nodes, reported_starts)
         symptom = {
             "kind": "vertical-shift",
             "page": current["page"],
@@ -619,9 +745,18 @@ def compare(
             "shiftPt": round(delta, 1),
             "breaksInRowAbove": causes[:MAX_BREAKS],
         }
-        if nodes and causes:
-            symptom["nodes"] = match_nodes(nodes, break_keys(causes))
+        if causes:
+            if nodes:
+                symptom["nodes"] = match_nodes(nodes, break_keys(causes))
+        else:
+            added = extra_rows(reference, candidate, pairs_by_candidate_row, previous["row"], current["row"], target_of)
+            above = normalize("".join(reference.lines[index].text for index in reference.rows[previous["row"]].lines))
+            symptom["extraRows"] = added
+            symptom["hint"] = "wrapped-row" if added and all(normalize(text) in above for text in added) else "unknown"
+            if nodes:
+                symptom["nodes"] = match_nodes(nodes, row_keys(reference, previous["row"]))
         found.append({"impact": abs(delta), "rows": set(), "symptom": symptom})
+    found.extend(line_start_shifts(reference, candidate, pairs, nodes, reported_starts, target_of))
 
     found.sort(key=lambda item: (-item["impact"], item["symptom"]["page"], item["symptom"]["y"]))
     overflow = [

@@ -270,6 +270,93 @@ class SymptomTests(unittest.TestCase):
             [{"page": 1, "candidatePage": 2, "rowCount": 1, "rows": ["Omega"]}],
         )
 
+    def test_a_lone_wrapped_character_is_reported_as_an_extra_row(self) -> None:
+        # The last "日" of the row wraps on its own; one character is too
+        # short to align, so no break is found, but the added row is.
+        reference = document(
+            [
+                [line(100, 110, word(10, 60, "Dates:"))],
+                [line(100, 110, word(300, 310, "日"))],
+                [line(130, 140, word(10, 30, "Next"))],
+                [line(160, 170, word(10, 30, "Last"))],
+            ]
+        )
+        candidate = document(
+            [
+                [line(100, 110, word(10, 60, "Dates:"))],
+                [line(112, 122, word(10, 20, "日"))],
+                [line(142, 152, word(10, 30, "Next"))],
+                [line(172, 182, word(10, 30, "Last"))],
+            ]
+        )
+        nodes = [
+            {"address": "2/1", "styleName": "P1", "excerpt": layout_diff.normalize("Dates: 日")},
+            {"address": "2/2", "styleName": "P2", "excerpt": "Next"},
+        ]
+        report = compare(reference, candidate, nodes)
+        self.assertEqual(kinds(report), ["vertical-shift"])
+        symptom = report["symptoms"][0]
+        self.assertEqual(symptom["breaksInRowAbove"], [])
+        self.assertEqual(symptom["extraRows"], ["日"])
+        self.assertEqual(symptom["hint"], "wrapped-row")
+        self.assertEqual(symptom["nodes"], [{"address": "2/1", "styleName": "P1"}])
+
+    def test_a_shift_without_an_added_row_has_no_hint_but_names_nodes(self) -> None:
+        reference = document(
+            [
+                [line(100, 110, word(10, 60, "Title"))],
+                [line(130, 140, word(10, 30, "Next"))],
+                [line(160, 170, word(10, 30, "Last"))],
+            ]
+        )
+        candidate = document(
+            [
+                [line(100, 110, word(10, 60, "Title"))],
+                [line(136, 146, word(10, 30, "Next"))],
+                [line(166, 176, word(10, 30, "Last"))],
+            ]
+        )
+        nodes = [{"address": "1", "styleName": "P1", "excerpt": "Title"}]
+        (symptom,) = compare(reference, candidate, nodes)["symptoms"]
+        self.assertEqual(symptom["extraRows"], [])
+        self.assertEqual(symptom["hint"], "unknown")
+        self.assertEqual(symptom["nodes"], [{"address": "1", "styleName": "P1"}])
+
+    def test_lines_moved_sideways_without_wrapping_are_one_symptom(self) -> None:
+        # A negative margin moves both lines of the paragraph 20 pt left,
+        # out of their cell; nothing wraps differently.
+        reference = document(
+            [
+                [line(100, 110, word(40, 80, "first"), word(85, 120, "line")), line(112, 122, word(40, 90, "second"))],
+                [line(100, 110, word(300, 340, "Other"))],
+                [line(140, 150, word(10, 30, "Next"))],
+            ]
+        )
+        candidate = document(
+            [
+                [line(100, 110, word(20, 60, "first"), word(65, 100, "line")), line(112, 122, word(20, 70, "second"))],
+                [line(100, 110, word(300, 340, "Other"))],
+                [line(140, 150, word(10, 30, "Next"))],
+            ]
+        )
+        nodes = [{"address": "2/3", "styleName": "P3", "excerpt": layout_diff.normalize("first line second")}]
+        (symptom,) = compare(reference, candidate, nodes)["symptoms"]
+        self.assertEqual(symptom["kind"], "shifted-line-start")
+        self.assertEqual(symptom["shiftPt"], -20.0)
+        self.assertEqual(symptom["lineCount"], 2)
+        self.assertEqual(symptom["hint"], "shifted-start")
+        self.assertEqual(symptom["nodes"], [{"address": "2/3", "styleName": "P3"}])
+
+    def test_centred_text_that_got_wider_is_not_a_moved_line(self) -> None:
+        reference = document([[line(100, 110, word(200, 300, "Centred"))], [line(130, 140, word(10, 30, "Next"))]])
+        candidate = document([[line(100, 110, word(190, 310, "Centred"))], [line(130, 140, word(10, 30, "Next"))]])
+        self.assertEqual(compare(reference, candidate)["symptoms"], [])
+
+    def test_a_small_sideways_move_is_not_reported(self) -> None:
+        reference = document([[line(100, 110, word(40, 80, "Label"))], [line(130, 140, word(10, 30, "Next"))]])
+        candidate = document([[line(100, 110, word(44, 84, "Label"))], [line(130, 140, word(10, 30, "Next"))]])
+        self.assertEqual(compare(reference, candidate)["symptoms"], [])
+
     def test_a_running_footer_is_not_reported_as_a_shift(self) -> None:
         reference = document(
             [[line(100, 110, word(10, 40, "Body"))], [line(800, 810, word(10, 50, "Footer1"))]],
