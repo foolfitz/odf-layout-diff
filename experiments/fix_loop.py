@@ -13,6 +13,9 @@ and the history tells the model what the reverted change caused.
     python3 experiments/fix_loop.py --reference ref.pdf --odt form.odt \
         --tool path/to/odf-tool --assets path/to/odf-rs \
         --model gemma-4-12b --work /tmp/loop
+
+An .odt exported by Microsoft Word goes through prepare_word_odt.py first:
+odf-tool refuses to edit it as exported.
 """
 import argparse
 import hashlib
@@ -273,6 +276,10 @@ class Harness:
         }
         plan = self.tool(dict(base, options={"mode": "plan", "validationProfile": "extended-odf"}))
         if plan["status"] != "success":
+            errors = [item for item in plan.get("diagnostics", []) if item.get("severity") == "error"]
+            if errors:
+                first = errors[0]
+                print(f"  {len(errors)} validation errors, first in {first.get('part')}: {first.get('subject')}", flush=True)
             return plan["error"]["code"]
         commit = self.tool(
             dict(

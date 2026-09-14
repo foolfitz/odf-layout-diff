@@ -43,6 +43,23 @@ text matches, which is what a `set_style_properties` operation needs.
 `--threshold` (default 3.0 pt) is the smallest vertical shift reported;
 `--limit` (default 10) caps the number of symptoms.
 
+### Documents exported by Microsoft Word
+
+`python3 experiments/prepare_word_odt.py word.odt prepared.odt` prepares an
+`.odt` that Word exported before it is compared or fixed (needs `soffice`):
+
+- It fills in the text grid's base height (the line pitch: text area height
+  over lines per page) and ruby height (0), and turns a lines and
+  characters grid without a character pitch into a lines-only grid, as
+  LibreOffice's DOCX import does. Word leaves both heights out; LibreOffice
+  then lays every line out at least 30 pt high where Word's pitch is
+  typically about 18 pt, and the document gains pages.
+- It drops a fixed pitch from font faces with a non-ASCII family name.
+  With a UI in another language, LibreOffice finds such a name only
+  through fontconfig, where a fixed pitch puts monospace fonts first.
+- It saves the result again with LibreOffice: Word's export does not
+  satisfy the ODF schema, and `odf-tool` refuses to edit it.
+
 Run the tests with:
 
 ```bash
