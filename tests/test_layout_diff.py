@@ -44,6 +44,14 @@ def kinds(report: dict) -> list[str]:
     return [symptom["kind"] for symptom in report["symptoms"]]
 
 
+def all_breaks(report: dict) -> list[dict]:
+    return [
+        item
+        for symptom in report["symptoms"]
+        for item in symptom.get("breaks", []) + symptom.get("breaksInRowAbove", [])
+    ]
+
+
 class ParseTests(unittest.TestCase):
     def test_glyphs_are_placed_inside_their_word(self) -> None:
         layout = layout_diff.parse_layout(document([[line(100, 110, word(10, 30, "AB"))]]))
@@ -53,6 +61,16 @@ class ParseTests(unittest.TestCase):
 
     def test_normalization_drops_whitespace_and_folds_width(self) -> None:
         self.assertEqual(layout_diff.normalize("Ａ　B（c）"), "AB(c)")
+
+    def test_a_line_split_where_the_font_changes_is_joined(self) -> None:
+        # pdftotext splits a line before a full-width bracket set in another
+        # font; the two parts overlap.
+        layout = layout_diff.parse_layout(
+            document([[line(100, 110, word(10, 60, "改或使用。")), line(100, 110, word(57, 80, "【Athin"))]])
+        )
+        self.assertEqual(len(layout.lines), 1)
+        self.assertEqual("".join(glyph.char for glyph in layout.glyphs), "改或使用。【Athin")
+        self.assertEqual(len({glyph.segment for glyph in layout.glyphs}), 1)
 
 
 class SymptomTests(unittest.TestCase):
@@ -148,6 +166,58 @@ class SymptomTests(unittest.TestCase):
         self.assertEqual(cause["textAfterBreak"], "(GivenName)")
         self.assertEqual(cause["startShiftPt"], 71.0)
         self.assertEqual(cause["hint"], "shifted-start")
+
+    def test_text_in_the_middle_of_a_candidate_line_has_no_start_shift(self) -> None:
+        # The candidate breaks the first line earlier: "three" begins a
+        # reference line but sits after "two" in the candidate.
+        reference = document(
+            [
+                [
+                    line(100, 110, word(10, 30, "one"), word(35, 55, "two")),
+                    line(112, 122, word(10, 40, "three"), word(45, 70, "four")),
+                ],
+                [line(140, 150, word(10, 30, "Next"))],
+            ]
+        )
+        candidate = document(
+            [
+                [
+                    line(100, 110, word(10, 30, "one")),
+                    line(112, 122, word(10, 30, "two"), word(35, 65, "three")),
+                    line(124, 134, word(10, 35, "four")),
+                ],
+                [line(152, 162, word(10, 30, "Next"))],
+            ]
+        )
+        found = all_breaks(compare(reference, candidate))
+        self.assertIn("three", [item["textBeforeBreak"] for item in found])
+        self.assertNotIn("shifted-start", [item["hint"] for item in found])
+
+    def test_a_later_segment_of_the_same_paragraph_is_not_a_shifted_start(self) -> None:
+        # "(note)" follows "Signature:" after a run of spaces in one
+        # paragraph. The candidate's spaces are wider, so "(note)" starts
+        # 20 pt further right and "more" wraps: the space run, not an indent.
+        reference = document(
+            [
+                [line(100, 110, word(10, 60, "Signature:"))],
+                [line(100, 110, word(300, 330, "(note)"), word(335, 360, "more"))],
+                [line(130, 140, word(10, 30, "Next"))],
+            ]
+        )
+        candidate = document(
+            [
+                [line(100, 110, word(10, 60, "Signature:"))],
+                [line(100, 110, word(320, 350, "(note)")), line(124, 134, word(10, 35, "more"))],
+                [line(154, 164, word(10, 30, "Next"))],
+            ]
+        )
+        nodes = [{"address": "2/1", "styleName": "P1", "excerpt": layout_diff.normalize("Signature: (note) more")}]
+        (without_nodes,) = [item for item in all_breaks(compare(reference, candidate)) if item["textBeforeBreak"] == "(note)"]
+        self.assertEqual(without_nodes["startShiftPt"], 20.0)
+        self.assertEqual(without_nodes["hint"], "shifted-start")
+        (cause,) = [item for item in all_breaks(compare(reference, candidate, nodes)) if item["textBeforeBreak"] == "(note)"]
+        self.assertIsNone(cause["startShiftPt"])
+        self.assertEqual(cause["hint"], "wide-gap")
 
     def test_a_neighbour_cell_sitting_lower_is_not_a_line_break(self) -> None:
         reference = document(

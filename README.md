@@ -81,8 +81,8 @@ python3 -m unittest discover -s tests -t . -v
     right of a cell by spaces).
 - Each break has `textBeforeBreak`/`textAfterBreak` (normalized: NFKC, no
   whitespace), `startShiftPt` (how far right the candidate starts the text
-  before the break; `null` unless that text begins a line or a segment of
-  one, since mid-line positions only reflect the reflow), `gapPt` (the horizontal gap between the two sides where
+  before the break; `null` unless that text begins a line, or a segment of
+  one, in both renderings), `gapPt` (the horizontal gap between the two sides where
   they share a line), `widthRatio` (candidate width over reference width of
   the text on both sides), and a `hint`, the first that applies:
   - `shifted-start`: the text before the break starts at least 3 pt away
@@ -93,14 +93,22 @@ python3 -m unittest discover -s tests -t . -v
     (`widthRatio` above 1.005). Letter spacing, character scaling, font
     size or font substitution are the usual causes.
   - `wide-gap`: the text is not wider, but the break falls at a gap of at
-    least 20 pt, typically a run of spaces used for alignment.
+    least 20 pt, typically a run of spaces used for alignment. Also used
+    when the text before the break continues, after a gap of at least
+    20 pt, a paragraph whose earlier text sits left of it on the same row
+    (known from `--projection` excerpts) and starts at least 3 pt further
+    right: the spaces before it got wider, which is not an indent, so no
+    `startShiftPt` is given. Without a projection such text is treated as
+    a line start.
   - `unknown`: neither applies.
 
 ## How it works
 
 1. `pdftotext -bbox-layout` gives pages, blocks, lines and word boxes.
-   Every word is split into normalized characters with an interpolated x
-   position.
+   `pdftotext` splits one visual line where the font or baseline changes
+   (for example before a full-width bracket); lines of one block on the
+   same row that overlap or touch are joined back. Every word is split
+   into normalized characters with an interpolated x position.
 2. The two character streams are aligned with `difflib`, with a
    separator between text blocks that never matches, so a match cannot run
    from one block into the next. Matching blocks shorter than three

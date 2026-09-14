@@ -47,6 +47,9 @@ BACK_LEFT_PT = 1.0
 SHIFTED_START_PT = 3.0
 WIDER_TEXT_RATIO = 1.005
 WIDE_GAP_PT = 20.0
+# A `pdftotext` line in the same block and row that starts no further right
+# than this past the end of the previous one continues it.
+LINE_JOIN_PT = 1.0
 TEXT_LIMIT = 60
 NODE_KEY_LENGTH = 8
 MAX_BREAKS = 3
@@ -155,6 +158,7 @@ def parse_layout(xml_text: str) -> Layout:
         page_heights.append(float(page.get("height", "0")))
         for block in page.iter(f"{XHTML}block"):
             block_index += 1
+            block_lines: list[Line] = []
             for element in block.iter(f"{XHTML}line"):
                 words = [
                     Word(float(word.get("xMin")), float(word.get("xMax")), word.text or "")
@@ -162,18 +166,23 @@ def parse_layout(xml_text: str) -> Layout:
                 ]
                 if not words:
                     continue
-                line_index = len(lines)
-                lines.append(
-                    Line(
-                        page_number,
-                        block_index,
-                        float(element.get("xMin")),
-                        float(element.get("yMin")),
-                        float(element.get("xMax")),
-                        float(element.get("yMax")),
-                        words,
-                    )
+                line = Line(
+                    page_number,
+                    block_index,
+                    float(element.get("xMin")),
+                    float(element.get("yMin")),
+                    float(element.get("xMax")),
+                    float(element.get("yMax")),
+                    words,
                 )
+                if block_lines and continues_line(block_lines[-1], line):
+                    join_lines(block_lines[-1], line)
+                else:
+                    block_lines.append(line)
+            for line in block_lines:
+                line_index = len(lines)
+                lines.append(line)
+                words = line.words
                 segment_index += 1
                 for previous, word in zip([None, *words], words):
                     if previous is not None and word.x_min - previous.x_max >= WIDE_GAP_PT:
@@ -185,6 +194,22 @@ def parse_layout(xml_text: str) -> Layout:
     layout = Layout(page_heights, lines, glyphs)
     assign_rows(layout)
     return layout
+
+
+def continues_line(previous: Line, line: Line) -> bool:
+    """`pdftotext` splits one visual line where the font or baseline changes
+    (for example before a full-width bracket); the parts overlap or touch."""
+    return (
+        abs(line.center - previous.center) <= ROW_TOLERANCE * min(line.height, previous.height)
+        and previous.x_min <= line.x_min <= previous.x_max + LINE_JOIN_PT
+    )
+
+
+def join_lines(previous: Line, line: Line) -> None:
+    previous.words = sorted(previous.words + line.words, key=lambda word: word.x_min)
+    previous.x_max = max(previous.x_max, line.x_max)
+    previous.y_min = min(previous.y_min, line.y_min)
+    previous.y_max = max(previous.y_max, line.y_max)
 
 
 def assign_rows(layout: Layout) -> None:
@@ -329,8 +354,43 @@ def run_around(
     return run if step > 0 else run[::-1]
 
 
+def starts_segment(layout: Layout, glyph: int) -> bool:
+    return glyph == 0 or layout.glyphs[glyph - 1].segment != layout.glyphs[glyph].segment
+
+
+def segment_text(layout: Layout, glyph: int, step: int) -> str:
+    """Up to NODE_KEY_LENGTH characters of `glyph`'s segment, starting at it
+    (`step` 1) or ending at it (`step` -1)."""
+    segment = layout.glyphs[glyph].segment
+    chars = []
+    while 0 <= glyph < len(layout.glyphs) and layout.glyphs[glyph].segment == segment and len(chars) < NODE_KEY_LENGTH:
+        chars.append(layout.glyphs[glyph].char)
+        glyph += step
+    return "".join(chars if step > 0 else reversed(chars))
+
+
+def paragraph_neighbour(layout: Layout, glyph: int, nodes: list[dict]) -> int | None:
+    """The glyph just left of `glyph` on its row, when a projection excerpt
+    shows both belong to one paragraph: `glyph` then starts a later segment
+    of that paragraph, after a run of spaces, not a line."""
+    if not nodes:
+        return None
+    row, x = layout.row_of(glyph), layout.glyphs[glyph].x
+    left = [index for index, other in enumerate(layout.glyphs) if other.x < x and layout.row_of(index) == row]
+    if not left:
+        return None
+    neighbour = max(left, key=lambda index: layout.glyphs[index].x)
+    joined = segment_text(layout, neighbour, -1) + segment_text(layout, glyph, 1)
+    return neighbour if any(joined in node["excerpt"] for node in nodes) else None
+
+
 def describe_break(
-    kind: str, reference: Layout, candidate: Layout, members: list[tuple[int, int]], index: int
+    kind: str,
+    reference: Layout,
+    candidate: Layout,
+    members: list[tuple[int, int]],
+    index: int,
+    nodes: list[dict],
 ) -> dict:
     """The break between `members[index]` and `members[index + 1]`."""
     if kind == "added":
@@ -347,15 +407,26 @@ def describe_break(
     # The gap is measured in the layout where both sides share one line.
     gap = shared.glyphs[after[0][shared_index]].x - shared.glyphs[before[-1][shared_index]].x
     # A start position only means something where the text before the break
-    # begins a reference segment; mid-line it just reflects the reflow.
-    first = before[0][0]
-    starts_segment = first == 0 or reference.glyphs[first - 1].segment != reference.glyphs[first].segment
-    start_shift = candidate.glyphs[before[0][1]].x - reference.glyphs[first].x if starts_segment else None
+    # begins a line in both layouts: mid-line it just reflects the reflow, and
+    # after a run of spaces in its own paragraph it reflects that run's width.
+    first, first_candidate = before[0]
+    shift = candidate.glyphs[first_candidate].x - reference.glyphs[first].x
+    start_shift = None
+    after_wider_gap = False
+    if starts_segment(reference, first) and starts_segment(candidate, first_candidate):
+        neighbour = paragraph_neighbour(reference, first, nodes)
+        if neighbour is None:
+            start_shift = shift
+        else:
+            after_wider_gap = (
+                shift >= SHIFTED_START_PT
+                and reference.glyphs[first].x - reference.glyphs[neighbour].x >= WIDE_GAP_PT
+            )
     if start_shift is not None and abs(start_shift) >= SHIFTED_START_PT:
         hint = "shifted-start"
     elif ratio is not None and ratio > WIDER_TEXT_RATIO:
         hint = "wider-text"
-    elif gap >= WIDE_GAP_PT:
+    elif gap >= WIDE_GAP_PT or after_wider_gap:
         hint = "wide-gap"
     else:
         hint = "unknown"
@@ -385,7 +456,9 @@ def without_reflow(breaks: list[dict]) -> list[dict]:
     return kept
 
 
-def row_breaks(reference: Layout, candidate: Layout, members: list[tuple[int, int]]) -> list[dict]:
+def row_breaks(
+    reference: Layout, candidate: Layout, members: list[tuple[int, int]], nodes: list[dict]
+) -> list[dict]:
     """Line breaks the candidate added inside one reference row, across
     whatever text blocks the row is made of."""
     members = sorted(members, key=lambda pair: (reference.glyphs[pair[0]].x, pair[0]))
@@ -393,7 +466,7 @@ def row_breaks(reference: Layout, candidate: Layout, members: list[tuple[int, in
     for index in range(len(members) - 1):
         (_, b1), (_, b2) = members[index], members[index + 1]
         if candidate.row_of(b1) != candidate.row_of(b2) and candidate.is_new_line(b1, b2):
-            found.append(describe_break("added", reference, candidate, members, index))
+            found.append(describe_break("added", reference, candidate, members, index, nodes))
     return without_reflow(found)
 
 
@@ -425,10 +498,10 @@ def block_changes(reference: Layout, candidate: Layout, pairs: list[tuple[int, i
             same_candidate_row = candidate.row_of(b1) == candidate.row_of(b2)
             if same_reference_row and not same_candidate_row and candidate.is_new_line(b1, b2):
                 if {candidate.row_of(b1), candidate.row_of(b2)} <= candidate_rows:
-                    breaks.append(describe_break("added", reference, candidate, members, index))
+                    breaks.append(describe_break("added", reference, candidate, members, index, nodes))
             elif same_candidate_row and not same_reference_row and reference.is_new_line(a1, a2):
                 if {reference.row_of(a1), reference.row_of(a2)} <= reference_rows:
-                    breaks.append(describe_break("removed", reference, candidate, members, index))
+                    breaks.append(describe_break("removed", reference, candidate, members, index, nodes))
         # Counting breaks rather than rows keeps a block that holds several
         # side-by-side cells from reporting their mutual misalignment.
         line_change = sum(1 if item["kind"] == "added" else -1 for item in breaks)
@@ -536,7 +609,7 @@ def compare(
         if following is not None and following["page"] == current["page"]:
             if abs(following["shift"] - previous["shift"]) < threshold:
                 continue
-        causes = row_breaks(reference, candidate, pairs_by_row[previous["row"]])
+        causes = row_breaks(reference, candidate, pairs_by_row[previous["row"]], nodes)
         symptom = {
             "kind": "vertical-shift",
             "page": current["page"],
