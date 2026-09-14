@@ -90,8 +90,10 @@ python3 -m unittest discover -s tests -t . -v
     on (about a cell's padding). Lines of one block moved by the same
     amount form one symptom (`lineCount`); `hint` is always
     `shifted-start`. A line start already given as a break's
-    `startShiftPt`, a later segment of the same paragraph (see `wide-gap`)
-    and centred text whose two ends moved apart are left out.
+    `startShiftPt`, a later segment of the same paragraph (see `wide-gap`),
+    centred text whose two ends moved apart and two copies of the same text
+    on one row that moved by opposite amounts (each aligned with the other
+    copy because the cells were extracted in another order) are left out.
 - With `--projection`, every symptom kind carries `nodes`: for block
   changes and shifts with breaks, matched from the block text and the text
   around the breaks; for other shifts, from the lines of `rowAbove`; for

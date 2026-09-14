@@ -610,6 +610,27 @@ def line_start_shifts(
     text without wrapping it, for example out of its table cell. Consecutive
     lines of one block moved by the same amount form one symptom."""
     partner = dict(pairs)
+    starts_by_text: dict[str, list[int]] = {}
+    for glyph in range(len(reference.glyphs)):
+        if starts_segment(reference, glyph):
+            starts_by_text.setdefault(segment_text(reference, glyph, 1), []).append(glyph)
+
+    def on_another_copy(a: int, b: int) -> bool:
+        """The candidate text starts where another copy of the same text
+        starts in the reference, on a line beside it: the two copies (for
+        example one label in two cells, which may sit a few points apart
+        vertically) were aligned with each other because the renderings
+        extract them in another order."""
+        line = reference.line_of(a)
+        return any(
+            other != a
+            and reference.line_of(other).page == line.page
+            and reference.line_of(other).y_min < line.y_max
+            and line.y_min < reference.line_of(other).y_max
+            and abs(reference.glyphs[other].x - candidate.glyphs[b].x) < LINE_START_SHIFT_PT
+            for other in starts_by_text[segment_text(reference, a, 1)]
+        )
+
     groups: list[dict] = []
     for a, b in pairs:
         if a in reported_starts or not (starts_segment(reference, a) and starts_segment(candidate, b)):
@@ -618,6 +639,8 @@ def line_start_shifts(
             continue
         shift = candidate.glyphs[b].x - reference.glyphs[a].x
         if abs(shift) < LINE_START_SHIFT_PT or paragraph_neighbour(reference, a, nodes) is not None:
+            continue
+        if on_another_copy(a, b):
             continue
         end = segment_end(reference, a)
         end_partner = partner.get(end)

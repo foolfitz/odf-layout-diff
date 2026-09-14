@@ -357,6 +357,16 @@ class SymptomTests(unittest.TestCase):
         candidate = document([[line(100, 110, word(44, 84, "Label"))], [line(130, 140, word(10, 30, "Next"))]])
         self.assertEqual(compare(reference, candidate)["symptoms"], [])
 
+    def test_two_copies_of_a_label_extracted_in_another_order_are_not_moved_lines(self) -> None:
+        # Two cells of one row hold the same label; the candidate extracts the
+        # right cell first, so each copy aligns with the other one.
+        left = [line(100, 110, word(100, 150, "法定代理人"))]
+        right = [line(100, 110, word(300, 350, "法定代理人"))]
+        after = [line(140, 150, word(10, 30, "Next"))]
+        reference = document([left, right, after])
+        candidate = document([right, left, after])
+        self.assertEqual(compare(reference, candidate)["symptoms"], [])
+
     def test_a_running_footer_is_not_reported_as_a_shift(self) -> None:
         reference = document(
             [[line(100, 110, word(10, 40, "Body"))], [line(800, 810, word(10, 50, "Footer1"))]],
