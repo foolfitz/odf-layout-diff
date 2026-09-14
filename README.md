@@ -88,8 +88,11 @@ python3 -m unittest discover -s tests -t . -v
     reference row landed on, so nothing wraps differently: an indent or
     margin moved it, for example out of its table cell. Reported from 6 pt
     on (about a cell's padding). Lines of one block moved by the same
-    amount form one symptom (`lineCount`); `hint` is always
-    `shifted-start`. A line start already given as a break's
+    amount form one symptom (`lineCount`). `hint` is `shifted-start`, or
+    `wider-text` / `narrower-text` when the end of the line (including the
+    later segments of its paragraph on that row, known from `--projection`
+    excerpts) stayed within 3 pt: right-aligned text whose width changed,
+    which no indent fixes. A line start already given as a break's
     `startShiftPt`, a later segment of the same paragraph (see `wide-gap`),
     centred text whose two ends moved apart and two copies of the same text
     on one row that moved by opposite amounts (each aligned with the other

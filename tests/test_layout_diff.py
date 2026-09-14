@@ -367,6 +367,33 @@ class SymptomTests(unittest.TestCase):
         candidate = document([right, left, after])
         self.assertEqual(compare(reference, candidate)["symptoms"], [])
 
+    def test_a_right_aligned_line_that_got_wider_is_hinted_as_wider_text(self) -> None:
+        # One right-aligned paragraph with spaces between its two parts: the
+        # end stays where it was, the start moves left.
+        after = [line(140, 150, word(10, 30, "Next"))]
+        reference = document(
+            [[line(100, 110, word(218, 271, "申請人："))], [line(100, 110, word(426, 505, "（簽名蓋章）"))], after]
+        )
+        candidate = document(
+            [[line(100, 110, word(205, 259, "申請人："))], [line(100, 110, word(421, 503, "（簽名蓋章）"))], after]
+        )
+        nodes = [{"address": "1/3", "styleName": "P32", "excerpt": layout_diff.normalize("申請人：　　（簽名蓋章）")}]
+        (symptom,) = compare(reference, candidate, nodes)["symptoms"]
+        self.assertEqual(symptom["kind"], "shifted-line-start")
+        self.assertEqual(symptom["hint"], "wider-text")
+
+    def test_an_unaligned_repeated_note_is_found_by_its_text_on_the_row(self) -> None:
+        note = "（簽名蓋章）"
+        reference = layout_diff.parse_layout(
+            document([[line(100, 110, word(426, 505, note))], [line(120, 130, word(426, 505, note))]])
+        )
+        candidate = layout_diff.parse_layout(
+            document([[line(120, 130, word(300, 380, note))], [line(100, 110, word(421, 503, note))]])
+        )
+        end = len(note) - 1
+        found = layout_diff.same_text_on_row(reference, candidate, end, candidate.row_of(len(note)))
+        self.assertEqual(found, 2 * len(note) - 1)
+
     def test_a_running_footer_is_not_reported_as_a_shift(self) -> None:
         reference = document(
             [[line(100, 110, word(10, 40, "Body"))], [line(800, 810, word(10, 50, "Footer1"))]],

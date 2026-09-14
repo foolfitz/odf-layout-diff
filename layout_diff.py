@@ -394,6 +394,41 @@ def paragraph_neighbour(layout: Layout, glyph: int, nodes: list[dict]) -> int | 
     return neighbour if any(joined in node["excerpt"] for node in nodes) else None
 
 
+def paragraph_end(layout: Layout, glyph: int, nodes: list[dict]) -> int:
+    """The last glyph of the line `glyph` starts, following later segments
+    of the same paragraph on its row (see `paragraph_neighbour`)."""
+    end = segment_end(layout, glyph)
+    if not nodes:
+        return end
+    row = layout.row_of(glyph)
+    while True:
+        x = layout.glyphs[end].x
+        right = [index for index, other in enumerate(layout.glyphs) if other.x > x and layout.row_of(index) == row]
+        if not right:
+            return end
+        neighbour = min(right, key=lambda index: layout.glyphs[index].x)
+        joined = segment_text(layout, end, -1) + segment_text(layout, neighbour, 1)
+        if not starts_segment(layout, neighbour) or not any(joined in node["excerpt"] for node in nodes):
+            return end
+        end = segment_end(layout, neighbour)
+
+
+def same_text_on_row(reference: Layout, candidate: Layout, end: int, row: int) -> int | None:
+    """The candidate glyph that ends, on `row`, a segment ending with the
+    text of the reference segment `end` ends, nearest its reference
+    position: repeated text (a note after each of several labels) is often
+    left unaligned."""
+    key = segment_text(reference, end, -1)
+    ends = [
+        glyph
+        for glyph in range(len(candidate.glyphs))
+        if candidate.row_of(glyph) == row
+        and segment_end(candidate, glyph) == glyph
+        and segment_text(candidate, glyph, -1) == key
+    ]
+    return min(ends, key=lambda glyph: abs(candidate.glyphs[glyph].x - reference.glyphs[end].x), default=None)
+
+
 def describe_break(
     kind: str,
     reference: Layout,
@@ -642,19 +677,29 @@ def line_start_shifts(
             continue
         if on_another_copy(a, b):
             continue
-        end = segment_end(reference, a)
+        end = paragraph_end(reference, a, nodes)
         end_partner = partner.get(end)
-        if end_partner is not None and candidate.glyphs[end_partner].segment == candidate.glyphs[b].segment:
+        if end_partner is None:
+            end_partner = same_text_on_row(reference, candidate, end, candidate.row_of(b))
+        hint = "shifted-start"
+        if end_partner is not None and candidate.row_of(end_partner) == candidate.row_of(b):
             end_shift = candidate.glyphs[end_partner].x - reference.glyphs[end].x
             # Centred text that got wider or narrower moves both ends apart.
             if shift * end_shift < 0 and abs(shift + end_shift) <= LINE_JOIN_PT:
                 continue
+            # Right-aligned text keeps its end: the line got wider or narrower.
+            if end != a and abs(end_shift) < SHIFTED_START_PT:
+                hint = "wider-text" if shift < 0 else "narrower-text"
         block = reference.line_of(a).block
-        same = [group for group in groups if group["block"] == block and abs(shift - group["shift"]) <= LINE_JOIN_PT]
+        same = [
+            group
+            for group in groups
+            if group["block"] == block and group["hint"] == hint and abs(shift - group["shift"]) <= LINE_JOIN_PT
+        ]
         if same:
             same[0]["glyphs"].append(a)
         else:
-            groups.append({"block": block, "shift": shift, "glyphs": [a]})
+            groups.append({"block": block, "shift": shift, "hint": hint, "glyphs": [a]})
     found = []
     for group in groups:
         first = group["glyphs"][0]
@@ -666,7 +711,7 @@ def line_start_shifts(
             "text": shorten(segment_text(reference, first, 1, TEXT_LIMIT)),
             "lineCount": len(group["glyphs"]),
             "shiftPt": round(group["shift"], 1),
-            "hint": "shifted-start",
+            "hint": group["hint"],
         }
         if nodes:
             keys = [normalize(block_text(reference, group["block"]))[:NODE_KEY_LENGTH]]
