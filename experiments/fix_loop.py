@@ -3,9 +3,9 @@
 
 Each iteration renders the current .odt with LibreOffice, compares it with
 the reference PDF (layout_diff), shows the model the ranked symptoms plus the
-involved paragraphs' current properties, applies the style changes it asks
-for through `odf-tool protocol`, and repeats. Changes naming an address the
-model was not shown are rejected.
+involved paragraphs' current properties and effective indents, applies the
+style changes it asks for through `odf-tool protocol`, and repeats. Changes
+naming an address the model was not shown are rejected.
 
     python3 experiments/fix_loop.py --reference ref.pdf --odt form.odt \
         --tool path/to/odf-tool --assets path/to/odf-rs \
@@ -45,8 +45,9 @@ Rules:
 - Hints: "wide-gap" = a run of spaces no longer fits on the line; "wider-text" = the same text renders wider.
   For both, tightening fo:letter-spacing a little (for example -0.01cm to -0.03cm) usually removes the extra line.
 - "shifted-start" = the text starts startShiftPt points to the right (positive) or left (negative) of where it should.
-  Move it back with fo:text-indent or fo:margin-left. The current indent may be missing from the listed properties
-  (LibreOffice can store it in font-relative units the tool does not show); set an absolute value.
+  Move it back with fo:text-indent or fo:margin-left. "indentsPt" is the marginLeft, marginRight and textIndent
+  LibreOffice lays the paragraph out with, in points (a word instead of a number: it could not be determined).
+  Set an absolute value computed from it.
 - A symptom without a hint or without an address: skip it.
 - "history" lists your earlier changes and the symptoms that remained afterwards; use it to correct values."""
 
@@ -75,6 +76,19 @@ def schema() -> dict:
     }
 
 
+def style_operation(address: str, expected_style_name: str, assignments: dict[str, str]) -> dict:
+    """One `set_style_properties` change carrying every property for one paragraph."""
+    return {
+        "name": "set_style_properties",
+        "operationVersion": 8,
+        "target": {"documentFamily": "text", "anchorType": "paragraph-path", "anchor": address},
+        "arguments": {
+            "styleProperties": [{"propertyKey": key, "propertyValue": value} for key, value in assignments.items()]
+        },
+        "preconditions": {"expectedStyleName": expected_style_name},
+    }
+
+
 class Harness:
     def __init__(self, arguments: argparse.Namespace, work: pathlib.Path) -> None:
         self.arguments = arguments
@@ -92,26 +106,31 @@ class Harness:
     def sha(self, name: str) -> str:
         return hashlib.sha256((self.work / name).read_bytes()).hexdigest()
 
-    def project(self, name: str) -> dict:
-        return self.tool(
-            {
-                "protocolVersion": 1,
-                "requestId": "project",
-                "action": "project",
-                "source": name,
-                "expectedSourceSha256": self.sha(name),
-                "options": {},
-            }
-        )
+    def project(self, name: str, **options: object) -> dict:
+        """The `project` response, with the nodes of every window merged."""
+        nodes: list[dict] = []
+        offset = 0
+        while True:
+            response = self.tool(
+                {
+                    "protocolVersion": 1,
+                    "requestId": "project",
+                    "action": "project",
+                    "source": name,
+                    "expectedSourceSha256": self.sha(name),
+                    "options": {**options, "offset": offset},
+                }
+            )
+            if response["status"] != "success":
+                raise RuntimeError(f"project {name}: {response['error']['code']}")
+            nodes.extend(response["result"]["nodes"])
+            offset = response["result"]["window"]["nextOffset"]
+            if offset is None:
+                response["result"]["nodes"] = nodes
+                return response
 
-    def apply(self, source: str, output: str, change: dict) -> str | None:
-        operation = {
-            "name": "set_style_properties",
-            "operationVersion": 7,
-            "target": {"documentFamily": "text", "anchorType": "paragraph-path", "anchor": change["address"]},
-            "arguments": {"propertyKey": change["propertyKey"], "propertyValue": change["propertyValue"]},
-            "preconditions": {"expectedStyleName": change["expectedStyleName"]},
-        }
+    def apply(self, source: str, output: str, operations: list[dict]) -> str | None:
+        """Plans and commits the operations as one request; returns the error code on failure."""
         base = {
             "protocolVersion": 1,
             "requestId": "apply",
@@ -119,7 +138,7 @@ class Harness:
             "source": source,
             "expectedSourceSha256": self.sha(source),
             "output": output,
-            "operations": [operation],
+            "operations": operations,
         }
         plan = self.tool(dict(base, options={"mode": "plan", "validationProfile": "extended-odf"}))
         if plan["status"] != "success":
@@ -176,18 +195,30 @@ class Harness:
         return answer, time.monotonic() - started
 
 
-def payload(report: dict, projection: dict, history: list[dict]) -> dict:
-    by_address = {node["address"]: node for node in projection["result"]["nodes"]}
+def indents_pt(node: dict) -> dict:
+    """`effectiveIndents` in points; an unresolved indent gives its reason instead."""
+    return {
+        name: indent["pt"] if indent["pt"] is not None else indent.get("unresolved")
+        for name, indent in (node.get("effectiveIndents") or {}).items()
+    }
+
+
+def payload(report: dict, context: dict, history: list[dict]) -> dict:
+    """`context` is a projection narrowed to the symptoms' addresses and CONTEXT_KEYS."""
+    by_address = {node["address"]: node for node in context["result"]["nodes"]}
     symptoms = []
     for symptom in report["symptoms"]:
         nodes = []
         for node in symptom.get("nodes", []):
-            properties = {
-                item["propertyKey"]: item["value"]
-                for item in by_address[node["address"]]["computedProperties"]
-                if item["propertyKey"] in CONTEXT_KEYS
-            }
-            nodes.append({**node, "excerpt": by_address[node["address"]]["excerpt"], "properties": properties})
+            projected = by_address[node["address"]]
+            nodes.append(
+                {
+                    **node,
+                    "excerpt": projected["excerpt"],
+                    "properties": {item["propertyKey"]: item["value"] for item in projected["computedProperties"]},
+                    "indentsPt": indents_pt(projected),
+                }
+            )
         entry = {
             key: symptom[key]
             for key in ("kind", "page", "shiftPt", "heightChangePt", "lineChange", "rowAbove", "text")
@@ -218,6 +249,37 @@ def summary(report: dict) -> dict:
     }
 
 
+def apply_changes(harness: Harness, current: str, target: str, changes: list[dict], offered: set[str]) -> list[str]:
+    """Applies the changes to `current`, writing `target`; returns one outcome per change.
+
+    Changes for the same paragraph and expected style become one operation, and
+    all operations go in one request. That request fails as a whole, so on
+    failure each operation is retried alone: one bad change does not block the
+    others, and each outcome names its own error.
+    """
+    groups: dict[tuple[str, str], dict[str, str]] = {}
+    keys: list[tuple[str, str] | None] = []
+    for change in changes:
+        if change["address"] not in offered:
+            keys.append(None)
+            continue
+        key = (change["address"], change["expectedStyleName"])
+        groups.setdefault(key, {})[change["propertyKey"]] = change["propertyValue"]
+        keys.append(key)
+    results: dict[tuple[str, str], str] = {}
+    if groups and harness.apply(current, target, [style_operation(*key, a) for key, a in groups.items()]) is None:
+        results = dict.fromkeys(groups, "APPLIED")
+    else:
+        source = current
+        for index, (key, assignments) in enumerate(groups.items()):
+            output = f"{pathlib.Path(target).stem}_{index}.odt"
+            results[key] = harness.apply(source, output, [style_operation(*key, assignments)]) or "APPLIED"
+            if results[key] == "APPLIED":
+                source = output
+        shutil.copyfile(harness.work / source, harness.work / target)
+    return [results[key] if key else "REJECTED_ADDRESS_NOT_OFFERED" for key in keys]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--reference", required=True, help="PDF with the intended layout")
@@ -240,9 +302,8 @@ def main() -> int:
     log = []
     for iteration in range(arguments.iterations + 1):
         current = f"iter{iteration}.odt"
-        projection = harness.project(current)
         projection_path = work / f"iter{iteration}.project.json"
-        projection_path.write_text(json.dumps(projection, ensure_ascii=False))
+        projection_path.write_text(json.dumps(harness.project(current), ensure_ascii=False))
         nodes = layout_diff.load_projection_nodes([str(projection_path)])
         report = layout_diff.compare(reference, layout_diff.pdf_layout(str(harness.render(current))), nodes, limit=5)
         state = summary(report)
@@ -254,19 +315,18 @@ def main() -> int:
         log.append(entry)
         if (not report["rowsOnAnotherPage"] and not report["symptoms"]) or iteration == arguments.iterations:
             break
-        content = payload(report, projection, history)
+        offered = {node["address"] for symptom in report["symptoms"] for node in symptom.get("nodes", [])}
+        context = (
+            harness.project(current, addresses=sorted(offered), propertyKeys=CONTEXT_KEYS)
+            if offered
+            else {"result": {"nodes": []}}
+        )
+        content = payload(report, context, history)
         answer, seconds = harness.ask(content)
         entry.update({"promptBytes": len(json.dumps(content, ensure_ascii=False)), "seconds": round(seconds, 1), "answer": answer})
-        offered = {node["address"] for symptom in content["symptoms"] for node in symptom["nodes"]}
-        source = current
-        for index, change in enumerate(answer.get("changes", [])):
-            if change["address"] not in offered:
-                outcome = "REJECTED_ADDRESS_NOT_OFFERED"
-            else:
-                target = f"iter{iteration}_{index}.odt"
-                outcome = harness.apply(source, target, change) or "APPLIED"
-                if outcome == "APPLIED":
-                    source = target
+        changes = answer.get("changes", [])
+        outcomes = apply_changes(harness, current, f"iter{iteration + 1}.odt", changes, offered)
+        for change, outcome in zip(changes, outcomes):
             print(
                 f"  {change['address']} {change['propertyKey']}={change['propertyValue']} -> {outcome} "
                 f"({change['reason'][:90]})",
@@ -276,7 +336,6 @@ def main() -> int:
                 {"iteration": iteration, **{k: change[k] for k in ("address", "propertyKey", "propertyValue")}, "outcome": outcome}
             )
         print(f"  model {seconds:.1f}s, prompt {entry['promptBytes']} bytes", flush=True)
-        shutil.copyfile(work / source, work / f"iter{iteration + 1}.odt")
     (work / "log.json").write_text(json.dumps(log, ensure_ascii=False, indent=2))
     return 0
 
