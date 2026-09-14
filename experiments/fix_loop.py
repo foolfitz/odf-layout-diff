@@ -39,6 +39,7 @@ ALLOWED_KEYS = [LETTER_SPACING, TEXT_INDENT, MARGIN_LEFT]
 HINT_KEYS = {
     "wide-gap": [LETTER_SPACING],
     "wider-text": [LETTER_SPACING],
+    "narrower-text": [LETTER_SPACING],
     "wrapped-row": [LETTER_SPACING],
     "shifted-start": [TEXT_INDENT, MARGIN_LEFT],
 }
@@ -64,15 +65,18 @@ Rules:
 - Propose exactly one change: one symptom (prefer the first), one of its addresses, one of its allowedPropertyKeys.
   Each change is rendered and checked before the next round.
 - Values carry units (cm, mm, in or pt). Prefer the smallest change that removes the symptom.
-- Hints: "wide-gap" = a run of spaces no longer fits on the line; "wider-text" = the same text renders wider;
+- Hints: "wide-gap" = a run of spaces no longer fits on the line; "wider-text" = the same text renders wider
+  (on a right-aligned line its start moves left instead); "narrower-text" = narrower;
   "wrapped-row" = the end of the row above wrapped onto a line of its own ("extraRows").
-  For these, tightening fo:letter-spacing a little (for example -0.01cm to -0.03cm) usually removes the extra line.
+  For these, tightening fo:letter-spacing a little (for example -0.01cm to -0.03cm) usually removes the extra line;
+  for "narrower-text", loosen it instead.
 - "shifted-start" = the text starts startShiftPt (in a break) or shiftPt (kind "shifted-line-start") points to the
   right (positive) or left (negative) of where it should. "indentsPt" is the marginLeft, marginRight and textIndent
   LibreOffice lays the paragraph out with, in points (a word instead of a number: it could not be determined).
   Set fo:text-indent (first line only) or fo:margin-left (every line) to the current value minus the shift.
 - "history" lists earlier rounds. KEPT changes are in the document. REVERTED changes made the layout worse or caused
   "newSymptoms" and were undone: do not propose them again; try another value, key or symptom.
+  "NO_EFFECT" means the key did not move the text at all: that key of that paragraph is not offered again.
 - If no change is likely to help, return an empty "changes" list."""
 
 
@@ -125,9 +129,14 @@ def allowed_keys(symptom: dict) -> list[str]:
     return [key for key in ALLOWED_KEYS if key in allowed]
 
 
-def fixable(report: dict) -> list[dict]:
-    """Symptoms naming a node and hinting at a cause, in report order."""
-    return [symptom for symptom in report["symptoms"] if symptom.get("nodes") and allowed_keys(symptom)]
+def fixable(report: dict, tried: set[tuple] | frozenset = frozenset()) -> list[dict]:
+    """Symptoms naming a node and hinting at a cause, in report order, while
+    some allowed key of some node has not turned out to have no effect."""
+    return [
+        symptom
+        for symptom in report["symptoms"]
+        if any((node["address"], key) not in tried for node in symptom.get("nodes", []) for key in allowed_keys(symptom))
+    ]
 
 
 def impact(symptom: dict) -> float:
@@ -140,6 +149,13 @@ def rows_on_another_page(report: dict) -> int:
 
 def score(report: dict) -> float:
     return ROW_ON_ANOTHER_PAGE_PT * rows_on_another_page(report) + sum(impact(s) for s in report["symptoms"])
+
+
+def layout_state(report: dict) -> tuple:
+    """Everything the verdict looks at, to 0.1 pt."""
+    return rows_on_another_page(report), [
+        (s["kind"], s["page"], round(s["y"], 1), round(impact(s), 1)) for s in report["symptoms"]
+    ]
 
 
 def symptom_key(symptom: dict) -> tuple:
@@ -179,6 +195,8 @@ def judge(before: dict, after: dict) -> dict:
         reason = "MORE_ROWS_ON_ANOTHER_PAGE"
     elif new:
         reason = "NEW_SYMPTOM"
+    elif layout_state(after) == layout_state(before):
+        reason = "NO_EFFECT"
     elif score(after) > score(before) - MIN_IMPROVEMENT_PT:
         reason = "NO_IMPROVEMENT"
     else:
@@ -195,6 +213,8 @@ def check_change(change: dict, shown: list[dict], tried: set[tuple]) -> str | No
         return "REJECTED_ADDRESS_NOT_OFFERED"
     if change["propertyKey"] not in allowed_keys(symptom):
         return "REJECTED_KEY_NOT_ALLOWED"
+    if (change["address"], change["propertyKey"]) in tried:
+        return "REJECTED_NO_EFFECT"
     if (change["address"], change["propertyKey"], change["propertyValue"]) in tried:
         return "REJECTED_ALREADY_TRIED"
     return None
@@ -395,7 +415,7 @@ def main() -> int:
     tried: set[tuple] = set()
     log: list[dict] = [{"round": 0, "state": summary(report)}]
     for number in range(1, arguments.rounds + 1):
-        shown = fixable(report)[:PROMPT_SYMPTOMS]
+        shown = fixable(report, tried)[:PROMPT_SYMPTOMS]
         if not shown:
             print("no symptom left that names a node and a cause", flush=True)
             break
@@ -429,6 +449,8 @@ def main() -> int:
                 else:
                     outcome = "REVERTED"
                     record["why"] = verdict["reason"]
+                    if verdict["reason"] == "NO_EFFECT":
+                        tried.add((change["address"], change["propertyKey"]))
                     if verdict["newSymptoms"]:
                         record["newSymptoms"] = verdict["newSymptoms"][:3]
         record["outcome"] = outcome

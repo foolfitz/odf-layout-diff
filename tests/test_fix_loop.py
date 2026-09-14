@@ -56,6 +56,14 @@ class HintTests(unittest.TestCase):
         offered = block("c", 5)
         self.assertEqual(fix_loop.fixable(report([unknown, without_node, offered])), [offered])
 
+    def test_a_symptom_whose_keys_had_no_effect_is_not_offered_again(self) -> None:
+        symptom = block("a", 5, "wide-gap")
+        self.assertEqual(fix_loop.fixable(report([symptom]), {("2/1", fix_loop.LETTER_SPACING)}), [])
+
+    def test_a_right_aligned_line_that_got_narrower_allows_letter_spacing(self) -> None:
+        narrower = dict(moved_line("b", 12.5), hint="narrower-text")
+        self.assertEqual(fix_loop.allowed_keys(narrower), [fix_loop.LETTER_SPACING])
+
 
 class JudgeTests(unittest.TestCase):
     def test_a_smaller_symptom_is_kept(self) -> None:
@@ -86,6 +94,11 @@ class JudgeTests(unittest.TestCase):
         verdict = fix_loop.judge(report([block("a", 20.0)], 1), report([], 2))
         self.assertEqual(verdict["reason"], "MORE_ROWS_ON_ANOTHER_PAGE")
 
+    def test_an_unchanged_layout_is_no_effect(self) -> None:
+        # A margin on a right-aligned paragraph moves nothing.
+        verdict = fix_loop.judge(report([moved_line("sig", -12.5)]), report([moved_line("sig", -12.5)]))
+        self.assertEqual(verdict["reason"], "NO_EFFECT")
+
 
 class CheckChangeTests(unittest.TestCase):
     def change(self, **overrides: object) -> dict:
@@ -110,6 +123,11 @@ class CheckChangeTests(unittest.TestCase):
     def test_a_change_already_tried_is_rejected(self) -> None:
         tried = {("2/1", fix_loop.LETTER_SPACING, "-0.02cm")}
         self.assertEqual(fix_loop.check_change(self.change(), [block("a", 5)], tried), "REJECTED_ALREADY_TRIED")
+
+    def test_a_key_that_had_no_effect_is_rejected_for_any_value(self) -> None:
+        tried = {("2/1", fix_loop.LETTER_SPACING)}
+        change = self.change(propertyValue="-0.05cm")
+        self.assertEqual(fix_loop.check_change(change, [block("a", 5)], tried), "REJECTED_NO_EFFECT")
 
 
 if __name__ == "__main__":
