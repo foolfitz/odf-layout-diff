@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Experiment: a local model fixes layout symptoms through odf-tool.
 
-Each iteration renders the current .odt with LibreOffice, compares it with
-the reference PDF (layout_diff), shows the model the ranked symptoms plus the
-involved paragraphs' current properties and effective indents, applies the
-style changes it asks for through `odf-tool protocol`, and repeats. Changes
-naming an address the model was not shown are rejected.
+Each round shows the model the ranked symptoms of the current .odt (rendered
+with LibreOffice and compared with the reference PDF by layout_diff), the
+involved paragraphs' current properties and effective indents, and the
+property keys each symptom's hints allow. The model proposes one style
+change, which is applied through `odf-tool protocol`, rendered and compared
+again. The change is kept only if the layout improved and no new symptom
+appeared; otherwise the next round starts again from the last kept document,
+and the history tells the model what the reverted change caused.
 
     python3 experiments/fix_loop.py --reference ref.pdf --odt form.odt \
         --tool path/to/odf-tool --assets path/to/odf-rs \
-        --model gemma-4-12b --no-think --work /tmp/loop
+        --model gemma-4-12b --work /tmp/loop
 """
 import argparse
 import hashlib
@@ -24,32 +27,53 @@ import urllib.request
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import layout_diff  # noqa: E402
 
-ALLOWED_KEYS = [
-    "style:text-properties/fo:letter-spacing",
-    "style:text-properties/fo:font-size",
-    "style:paragraph-properties/fo:text-indent",
-    "style:paragraph-properties/fo:margin-left",
-    "style:paragraph-properties/fo:margin-right",
-]
+LETTER_SPACING = "style:text-properties/fo:letter-spacing"
+TEXT_INDENT = "style:paragraph-properties/fo:text-indent"
+MARGIN_LEFT = "style:paragraph-properties/fo:margin-left"
+ALLOWED_KEYS = [LETTER_SPACING, TEXT_INDENT, MARGIN_LEFT]
+# The keys each hint allows. A key the hint does not explain tends to remove
+# one symptom by causing another (a negative margin for text that wraps
+# pushes it out of its cell). fo:font-size is not offered: on the paragraph
+# style it loses to the spans' own sizes, and runs of spaces take the Asian
+# size, so it changed nothing on the forms tried.
+HINT_KEYS = {
+    "wide-gap": [LETTER_SPACING],
+    "wider-text": [LETTER_SPACING],
+    "wrapped-row": [LETTER_SPACING],
+    "shifted-start": [TEXT_INDENT, MARGIN_LEFT],
+}
 CONTEXT_KEYS = ALLOWED_KEYS + [
+    "style:text-properties/fo:font-size",
+    "style:paragraph-properties/fo:margin-right",
     "style:paragraph-properties/fo:text-align",
     "style:paragraph-properties/fo:line-height",
 ]
+# Symptoms shown to the model per round; the verdict uses all of them.
+PROMPT_SYMPTOMS = 5
+REPORT_LIMIT = 1000
+# One row pushed onto another page weighs as much as this many points of shift.
+ROW_ON_ANOTHER_PAGE_PT = 50.0
+# A change is kept only if it lowers the score by at least this much.
+MIN_IMPROVEMENT_PT = 0.5
 
 SYSTEM = """You fix layout differences in an OpenDocument text document.
 A tool rendered the document with LibreOffice (candidate) and compared it with the intended layout (reference).
-You get the ranked symptoms. Each names the paragraphs involved (address, styleName) and their current properties.
+You get the ranked symptoms. Each has an id, the paragraphs involved (address) with their current properties,
+and allowedPropertyKeys: the only keys that may fix it.
 Rules:
-- Propose at most one style change per symptom, only for listed addresses, only with the allowed property keys.
-- Values carry units (cm, mm, in, pt or %). Prefer the smallest change that removes the symptom.
-- Hints: "wide-gap" = a run of spaces no longer fits on the line; "wider-text" = the same text renders wider.
-  For both, tightening fo:letter-spacing a little (for example -0.01cm to -0.03cm) usually removes the extra line.
-- "shifted-start" = the text starts startShiftPt points to the right (positive) or left (negative) of where it should.
-  Move it back with fo:text-indent or fo:margin-left. "indentsPt" is the marginLeft, marginRight and textIndent
+- Propose exactly one change: one symptom (prefer the first), one of its addresses, one of its allowedPropertyKeys.
+  Each change is rendered and checked before the next round.
+- Values carry units (cm, mm, in or pt). Prefer the smallest change that removes the symptom.
+- Hints: "wide-gap" = a run of spaces no longer fits on the line; "wider-text" = the same text renders wider;
+  "wrapped-row" = the end of the row above wrapped onto a line of its own ("extraRows").
+  For these, tightening fo:letter-spacing a little (for example -0.01cm to -0.03cm) usually removes the extra line.
+- "shifted-start" = the text starts startShiftPt (in a break) or shiftPt (kind "shifted-line-start") points to the
+  right (positive) or left (negative) of where it should. "indentsPt" is the marginLeft, marginRight and textIndent
   LibreOffice lays the paragraph out with, in points (a word instead of a number: it could not be determined).
-  Set an absolute value computed from it.
-- A symptom without a hint or without an address: skip it.
-- "history" lists your earlier changes and the symptoms that remained afterwards; use it to correct values."""
+  Set fo:text-indent (first line only) or fo:margin-left (every line) to the current value minus the shift.
+- "history" lists earlier rounds. KEPT changes are in the document. REVERTED changes made the layout worse or caused
+  "newSymptoms" and were undone: do not propose them again; try another value, key or symptom.
+- If no change is likely to help, return an empty "changes" list."""
 
 
 def schema() -> dict:
@@ -58,17 +82,17 @@ def schema() -> dict:
         "properties": {
             "changes": {
                 "type": "array",
-                "maxItems": 5,
+                "maxItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
                         "reason": {"type": "string"},
+                        "symptomId": {"type": "integer"},
                         "address": {"type": "string"},
-                        "expectedStyleName": {"type": "string"},
                         "propertyKey": {"enum": ALLOWED_KEYS},
-                        "propertyValue": {"type": "string", "pattern": "^-?[0-9]+(\\.[0-9]+)?(cm|mm|in|pt|%)$"},
+                        "propertyValue": {"type": "string", "pattern": "^-?[0-9]+(\\.[0-9]+)?(cm|mm|in|pt)$"},
                     },
-                    "required": ["reason", "address", "expectedStyleName", "propertyKey", "propertyValue"],
+                    "required": ["reason", "symptomId", "address", "propertyKey", "propertyValue"],
                 },
             }
         },
@@ -87,6 +111,93 @@ def style_operation(address: str, expected_style_name: str, assignments: dict[st
         },
         "preconditions": {"expectedStyleName": expected_style_name},
     }
+
+
+def hints(symptom: dict) -> list[str]:
+    found = [item["hint"] for item in symptom.get("breaks", []) + symptom.get("breaksInRowAbove", [])]
+    if "hint" in symptom:
+        found.append(symptom["hint"])
+    return found
+
+
+def allowed_keys(symptom: dict) -> list[str]:
+    allowed = {key for hint in hints(symptom) for key in HINT_KEYS.get(hint, [])}
+    return [key for key in ALLOWED_KEYS if key in allowed]
+
+
+def fixable(report: dict) -> list[dict]:
+    """Symptoms naming a node and hinting at a cause, in report order."""
+    return [symptom for symptom in report["symptoms"] if symptom.get("nodes") and allowed_keys(symptom)]
+
+
+def impact(symptom: dict) -> float:
+    return abs(symptom["shiftPt"] if "shiftPt" in symptom else symptom["heightChangePt"])
+
+
+def rows_on_another_page(report: dict) -> int:
+    return sum(item["rowCount"] for item in report["rowsOnAnotherPage"])
+
+
+def score(report: dict) -> float:
+    return ROW_ON_ANOTHER_PAGE_PT * rows_on_another_page(report) + sum(impact(s) for s in report["symptoms"])
+
+
+def symptom_key(symptom: dict) -> tuple:
+    return (symptom["kind"], symptom["page"], symptom.get("text") or symptom.get("row"))
+
+
+def direction(symptom: dict) -> str:
+    return "sideways" if symptom["kind"] == "shifted-line-start" else "vertical"
+
+
+def is_new(symptom: dict, earlier: list[dict]) -> bool:
+    """No earlier symptom moving text in the same direction names one of its
+    nodes (or, without nodes, has its kind and text). A partial fix often
+    turns a vertical shift into a taller block at the same paragraph; that
+    is the same problem, while text of that paragraph moving sideways is not."""
+    addresses = {node["address"] for node in symptom.get("nodes", [])}
+    return not any(
+        direction(other) == direction(symptom)
+        and (addresses & {node["address"] for node in other.get("nodes", [])} or symptom_key(other) == symptom_key(symptom))
+        for other in earlier
+    )
+
+
+def brief(symptom: dict) -> dict:
+    return {
+        "kind": symptom["kind"],
+        "page": symptom["page"],
+        "text": symptom.get("text") or symptom.get("row"),
+        "pt": round(impact(symptom), 1),
+    }
+
+
+def judge(before: dict, after: dict) -> dict:
+    """Whether the document behind `after` should replace the one behind `before`."""
+    new = [brief(symptom) for symptom in after["symptoms"] if is_new(symptom, before["symptoms"])]
+    if rows_on_another_page(after) > rows_on_another_page(before):
+        reason = "MORE_ROWS_ON_ANOTHER_PAGE"
+    elif new:
+        reason = "NEW_SYMPTOM"
+    elif score(after) > score(before) - MIN_IMPROVEMENT_PT:
+        reason = "NO_IMPROVEMENT"
+    else:
+        reason = None
+    return {"kept": reason is None, "reason": reason, "newSymptoms": new}
+
+
+def check_change(change: dict, shown: list[dict], tried: set[tuple]) -> str | None:
+    """Why the change cannot be applied, or None."""
+    if not 1 <= change["symptomId"] <= len(shown):
+        return "REJECTED_UNKNOWN_SYMPTOM"
+    symptom = shown[change["symptomId"] - 1]
+    if change["address"] not in {node["address"] for node in symptom["nodes"]}:
+        return "REJECTED_ADDRESS_NOT_OFFERED"
+    if change["propertyKey"] not in allowed_keys(symptom):
+        return "REJECTED_KEY_NOT_ALLOWED"
+    if (change["address"], change["propertyKey"], change["propertyValue"]) in tried:
+        return "REJECTED_ALREADY_TRIED"
+    return None
 
 
 class Harness:
@@ -165,9 +276,9 @@ class Harness:
         body = {
             "model": self.arguments.model,
             "temperature": 0,
-            # Reasoning models spend most of the budget thinking before the answer.
-            "max_tokens": 12000,
-            "chat_template_kwargs": {"enable_thinking": not self.arguments.no_think},
+            "max_tokens": self.arguments.max_tokens,
+            # Reasoning models spend the whole budget thinking unless told not to.
+            "chat_template_kwargs": {"enable_thinking": self.arguments.think},
             "messages": [
                 {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": json.dumps(content, ensure_ascii=False)},
@@ -191,6 +302,7 @@ class Harness:
         try:
             answer = json.loads(text)
         except json.JSONDecodeError:
+            print("  no parsable answer" + (" (the reasoning used up max_tokens)" if reasoning else ""), flush=True)
             answer = {"changes": []}
         return answer, time.monotonic() - started
 
@@ -203,81 +315,51 @@ def indents_pt(node: dict) -> dict:
     }
 
 
-def payload(report: dict, context: dict, history: list[dict]) -> dict:
-    """`context` is a projection narrowed to the symptoms' addresses and CONTEXT_KEYS."""
+def payload(shown: list[dict], report: dict, context: dict, history: list[dict]) -> dict:
+    """`context` is a projection narrowed to the shown symptoms' addresses and CONTEXT_KEYS."""
     by_address = {node["address"]: node for node in context["result"]["nodes"]}
     symptoms = []
-    for symptom in report["symptoms"]:
-        nodes = []
-        for node in symptom.get("nodes", []):
-            projected = by_address[node["address"]]
-            nodes.append(
-                {
-                    **node,
-                    "excerpt": projected["excerpt"],
-                    "properties": {item["propertyKey"]: item["value"] for item in projected["computedProperties"]},
-                    "indentsPt": indents_pt(projected),
-                }
-            )
-        entry = {
-            key: symptom[key]
-            for key in ("kind", "page", "shiftPt", "heightChangePt", "lineChange", "rowAbove", "text")
-            if key in symptom and symptom[key] is not None
-        }
+    for number, symptom in enumerate(shown, start=1):
+        entry = {"id": number}
+        for key in ("kind", "page", "shiftPt", "heightChangePt", "lineChange", "lineCount", "rowAbove", "text"):
+            if symptom.get(key) is not None:
+                entry[key] = symptom[key]
         breaks = symptom.get("breaks") or symptom.get("breaksInRowAbove") or []
-        entry["breaks"] = [
-            {key: item[key] for key in ("textBeforeBreak", "textAfterBreak", "hint", "startShiftPt", "widthRatio", "gapPt")}
-            for item in breaks
+        if breaks:
+            entry["breaks"] = [
+                {key: item[key] for key in ("textBeforeBreak", "textAfterBreak", "hint", "startShiftPt", "widthRatio", "gapPt")}
+                for item in breaks
+            ]
+        for key in ("extraRows", "hint"):
+            if key in symptom:
+                entry[key] = symptom[key]
+        entry["nodes"] = [
+            {
+                "address": node["address"],
+                "excerpt": by_address[node["address"]]["excerpt"],
+                "properties": {
+                    item["propertyKey"]: item["value"] for item in by_address[node["address"]]["computedProperties"]
+                },
+                "indentsPt": indents_pt(by_address[node["address"]]),
+            }
+            for node in symptom["nodes"]
         ]
-        entry["nodes"] = nodes
+        entry["allowedPropertyKeys"] = allowed_keys(symptom)
         symptoms.append(entry)
     return {
         "goal": "remove the symptoms; no row may move to another page",
         "rowsOnAnotherPage": report["rowsOnAnotherPage"],
         "symptoms": symptoms,
-        "allowedPropertyKeys": ALLOWED_KEYS,
         "history": history,
     }
 
 
 def summary(report: dict) -> dict:
     return {
-        "rowsOnAnotherPage": sum(item["rowCount"] for item in report["rowsOnAnotherPage"]),
-        "symptoms": [
-            (s["kind"], s["page"], round(s["y"]), s.get("shiftPt", s.get("heightChangePt"))) for s in report["symptoms"]
-        ],
+        "score": round(score(report), 1),
+        "rowsOnAnotherPage": rows_on_another_page(report),
+        "symptoms": [(s["kind"], s["page"], round(s["y"]), round(impact(s), 1)) for s in report["symptoms"][:8]],
     }
-
-
-def apply_changes(harness: Harness, current: str, target: str, changes: list[dict], offered: set[str]) -> list[str]:
-    """Applies the changes to `current`, writing `target`; returns one outcome per change.
-
-    Changes for the same paragraph and expected style become one operation, and
-    all operations go in one request. That request fails as a whole, so on
-    failure each operation is retried alone: one bad change does not block the
-    others, and each outcome names its own error.
-    """
-    groups: dict[tuple[str, str], dict[str, str]] = {}
-    keys: list[tuple[str, str] | None] = []
-    for change in changes:
-        if change["address"] not in offered:
-            keys.append(None)
-            continue
-        key = (change["address"], change["expectedStyleName"])
-        groups.setdefault(key, {})[change["propertyKey"]] = change["propertyValue"]
-        keys.append(key)
-    results: dict[tuple[str, str], str] = {}
-    if groups and harness.apply(current, target, [style_operation(*key, a) for key, a in groups.items()]) is None:
-        results = dict.fromkeys(groups, "APPLIED")
-    else:
-        source = current
-        for index, (key, assignments) in enumerate(groups.items()):
-            output = f"{pathlib.Path(target).stem}_{index}.odt"
-            results[key] = harness.apply(source, output, [style_operation(*key, assignments)]) or "APPLIED"
-            if results[key] == "APPLIED":
-                source = output
-        shutil.copyfile(harness.work / source, harness.work / target)
-    return [results[key] if key else "REJECTED_ADDRESS_NOT_OFFERED" for key in keys]
 
 
 def main() -> int:
@@ -288,54 +370,80 @@ def main() -> int:
     parser.add_argument("--assets", required=True, help="odf-rs checkout holding the protocol assets")
     parser.add_argument("--model", required=True)
     parser.add_argument("--endpoint", default="http://localhost:8418/v1/chat/completions")
-    parser.add_argument("--no-think", action="store_true", help="ask the chat template to skip reasoning")
+    parser.add_argument("--think", action="store_true", help="let a reasoning model think before answering")
+    parser.add_argument("--max-tokens", type=int, default=12000)
     parser.add_argument("--work", required=True, help="scratch directory, emptied first")
-    parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--rounds", type=int, default=8, help="most changes proposed")
     arguments = parser.parse_args()
     work = pathlib.Path(arguments.work).resolve()
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    shutil.copyfile(arguments.odt, work / "iter0.odt")
     harness = Harness(arguments, work)
     reference = layout_diff.pdf_layout(arguments.reference)
-    history: list[dict] = []
-    log = []
-    for iteration in range(arguments.iterations + 1):
-        current = f"iter{iteration}.odt"
-        projection_path = work / f"iter{iteration}.project.json"
-        projection_path.write_text(json.dumps(harness.project(current), ensure_ascii=False))
+
+    def evaluate(name: str) -> dict:
+        projection_path = work / f"{pathlib.Path(name).stem}.project.json"
+        projection_path.write_text(json.dumps(harness.project(name), ensure_ascii=False))
         nodes = layout_diff.load_projection_nodes([str(projection_path)])
-        report = layout_diff.compare(reference, layout_diff.pdf_layout(str(harness.render(current))), nodes, limit=5)
-        state = summary(report)
-        print(f"iteration {iteration}: {json.dumps(state, ensure_ascii=False)}", flush=True)
-        for item in history:
-            if item["iteration"] == iteration - 1:
-                item["afterwards"] = state
-        entry = {"iteration": iteration, "state": state}
-        log.append(entry)
-        if (not report["rowsOnAnotherPage"] and not report["symptoms"]) or iteration == arguments.iterations:
+        return layout_diff.compare(reference, layout_diff.pdf_layout(str(harness.render(name))), nodes, limit=REPORT_LIMIT)
+
+    current = "round0.odt"
+    shutil.copyfile(arguments.odt, work / current)
+    report = evaluate(current)
+    print(f"round 0: {json.dumps(summary(report), ensure_ascii=False)}", flush=True)
+    history: list[dict] = []
+    tried: set[tuple] = set()
+    log: list[dict] = [{"round": 0, "state": summary(report)}]
+    for number in range(1, arguments.rounds + 1):
+        shown = fixable(report)[:PROMPT_SYMPTOMS]
+        if not shown:
+            print("no symptom left that names a node and a cause", flush=True)
             break
-        offered = {node["address"] for symptom in report["symptoms"] for node in symptom.get("nodes", [])}
-        context = (
-            harness.project(current, addresses=sorted(offered), propertyKeys=CONTEXT_KEYS)
-            if offered
-            else {"result": {"nodes": []}}
-        )
-        content = payload(report, context, history)
+        offered = sorted({node["address"] for symptom in shown for node in symptom["nodes"]})
+        content = payload(shown, report, harness.project(current, addresses=offered, propertyKeys=CONTEXT_KEYS), history)
         answer, seconds = harness.ask(content)
-        entry.update({"promptBytes": len(json.dumps(content, ensure_ascii=False)), "seconds": round(seconds, 1), "answer": answer})
+        entry = {"round": number, "promptBytes": len(json.dumps(content, ensure_ascii=False)), "seconds": round(seconds, 1), "answer": answer}
+        log.append(entry)
         changes = answer.get("changes", [])
-        outcomes = apply_changes(harness, current, f"iter{iteration + 1}.odt", changes, offered)
-        for change, outcome in zip(changes, outcomes):
-            print(
-                f"  {change['address']} {change['propertyKey']}={change['propertyValue']} -> {outcome} "
-                f"({change['reason'][:90]})",
-                flush=True,
-            )
-            history.append(
-                {"iteration": iteration, **{k: change[k] for k in ("address", "propertyKey", "propertyValue")}, "outcome": outcome}
-            )
-        print(f"  model {seconds:.1f}s, prompt {entry['promptBytes']} bytes", flush=True)
+        if not changes:
+            print(f"round {number}: the model proposed no change", flush=True)
+            break
+        change = changes[0]
+        record = {"round": number, **{key: change[key] for key in ("symptomId", "address", "propertyKey", "propertyValue")}}
+        outcome = check_change(change, shown, tried)
+        if outcome is None:
+            tried.add((change["address"], change["propertyKey"], change["propertyValue"]))
+            symptom = shown[change["symptomId"] - 1]
+            record["symptom"] = brief(symptom)
+            style_name = next(node["styleName"] for node in symptom["nodes"] if node["address"] == change["address"])
+            attempt = f"round{number}.odt"
+            operation = style_operation(change["address"], style_name, {change["propertyKey"]: change["propertyValue"]})
+            outcome = harness.apply(current, attempt, [operation])
+            if outcome is None:
+                after = evaluate(attempt)
+                verdict = judge(report, after)
+                record.update(scoreBefore=round(score(report), 1), scoreAfter=round(score(after), 1))
+                if verdict["kept"]:
+                    outcome = "KEPT"
+                    current, report = attempt, after
+                else:
+                    outcome = "REVERTED"
+                    record["why"] = verdict["reason"]
+                    if verdict["newSymptoms"]:
+                        record["newSymptoms"] = verdict["newSymptoms"][:3]
+        record["outcome"] = outcome
+        history.append(record)
+        entry["record"] = record
+        entry["state"] = summary(report)
+        print(
+            f"round {number}: {change['address']} {change['propertyKey']}={change['propertyValue']} -> {outcome}"
+            f"{' ' + record['why'] if 'why' in record else ''} "
+            f"(score {record.get('scoreBefore')} -> {record.get('scoreAfter')}; model {seconds:.1f}s, "
+            f"prompt {entry['promptBytes']} bytes; {change['reason'][:80]})",
+            flush=True,
+        )
+    shutil.copyfile(work / current, work / "final.odt")
+    print(f"final ({current}): {json.dumps(summary(report), ensure_ascii=False)}", flush=True)
     (work / "log.json").write_text(json.dumps(log, ensure_ascii=False, indent=2))
     return 0
 
