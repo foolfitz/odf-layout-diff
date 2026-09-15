@@ -60,6 +60,15 @@ text matches, which is what a `set_style_properties` operation needs.
 - It saves the result again with LibreOffice: Word's export does not
   satisfy the ODF schema, and `odf-tool` refuses to edit it.
 
+### Corpus experiments
+
+`experiments/corpus/` builds a population of `.odt` files (`make_population.py`),
+renders variants of them under LibreOffice to compare page counts
+(`corpus_run.py`, `corpus_run_r.py`), and aggregates the results
+(`corpus_agg.py`). The corpus itself is third-party (Word- and ODF-tool-
+generated government documents) and lives outside this repository; every
+script takes its corpus and working directories as command-line arguments.
+
 Run the tests with:
 
 ```bash
