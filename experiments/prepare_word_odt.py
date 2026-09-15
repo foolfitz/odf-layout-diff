@@ -16,13 +16,25 @@ LibreOffice registers a font under the family name of its UI language only,
 looks any other name up through fontconfig, and a fixed pitch there puts
 monospace fonts first: with an English UI, 標楷體 is replaced.
 
+The settings are made to count. Word writes `settings.xml` with a self-closing
+root that does not declare `xmlns:ooo`, and the name of the settings block,
+`ooo:configuration-settings`, is resolved as a QName: without the declaration
+LibreOffice ignores the whole file, so every compatibility option keeps its
+application default. The declaration is added and
+`AdjustTableLineHeightsToGridHeight` is set to false, which stops table text
+being snapped to the grid.
+
 LibreOffice then saves the result again. Word's .odt export does not satisfy
 the ODF schema (its manifest has no `manifest:version`, for example), and
 `odf-tool` refuses to edit such a document; the resaved one renders the same.
+The re-save is not free: on the corpus it reached 189 exact page-count matches
+where `--no-resave`, which only fixes the namespace in place, reached 197. The
+measured best configuration is `--no-resave`.
 
     python3 experiments/prepare_word_odt.py word.odt prepared.odt
 """
 import argparse
+import functools
 import json
 import pathlib
 import re
@@ -31,6 +43,12 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from collections.abc import Callable
+
+try:
+    from experiments.corpus.inject import with_items
+except ImportError:  # run as a script, with experiments/ on the path
+    from corpus.inject import with_items
 
 POINTS_PER_UNIT = {"pt": 1.0, "pc": 12.0, "in": 72.0, "cm": 72.0 / 2.54, "mm": 72.0 / 25.4}
 LENGTH = re.compile(r"^(-?[0-9]*\.?[0-9]+)(pt|pc|in|cm|mm)$")
@@ -40,6 +58,11 @@ PAGE_LAYOUT = re.compile(r"<style:page-layout\s[^>]*>.*?</style:page-layout>", r
 PAGE_LAYOUT_PROPERTIES = re.compile(r"<style:page-layout-properties\s[^>]*>")
 HEADER_FOOTER_PROPERTIES = re.compile(r"<style:header-footer-properties\s[^>]*>")
 FONT_FACE = re.compile(r"<style:font-face\s[^>]*>")
+SETTINGS_ROOT = re.compile(r"<office:document-settings\b[^>]*>")
+SETTINGS = "settings.xml"
+# Table text is snapped to the grid unless this is off; the item is a QName
+# away from being read at all, which is what `with_items` repairs.
+COMPAT_ITEMS = {"AdjustTableLineHeightsToGridHeight": "false"}
 
 
 def attribute(tag: str, name: str) -> str | None:
@@ -115,24 +138,77 @@ def drop_fixed_pitch(xml: str) -> tuple[str, list[str]]:
     return FONT_FACE.sub(font_face, xml), changes
 
 
-def edit_package(source: pathlib.Path, target: pathlib.Path) -> list[str]:
-    """Writes `source` with the grid filled in and fixed pitches dropped to `target`."""
+def config_item(settings: str, name: str) -> str | None:
+    found = re.search(
+        rf'<config:config-item config:name="{re.escape(name)}" config:type="\w+">([^<]*)</config:config-item>', settings
+    )
+    return found.group(1) if found else None
+
+
+def with_compat_settings(settings: str) -> tuple[str, list[str]]:
+    """`settings.xml` with `xmlns:ooo` declared on its root and the
+    compatibility items set.
+
+    `inject.with_items` does the editing: it creates `office:settings` under a
+    self-closing root, declares the namespace, and asserts both afterwards.
+    """
+    root = SETTINGS_ROOT.search(settings)
+    if root is None:
+        raise RuntimeError("settings.xml has no <office:document-settings> root")
+    changes: list[str] = []
+    if "xmlns:ooo=" not in root.group(0):
+        changes.append("settings.xml: xmlns:ooo declared")
+    changes.extend(
+        f"settings.xml: {name}={value}" for name, value in COMPAT_ITEMS.items() if config_item(settings, name) != value
+    )
+    return with_items(settings, COMPAT_ITEMS), changes
+
+
+def rewrite_package(
+    source: pathlib.Path, target: pathlib.Path, edit: Callable[[str, bytes], tuple[bytes, list[str]]]
+) -> list[str]:
+    """Copies the package part by part through `edit`, mimetype first and stored."""
     changes: list[str] = []
     with zipfile.ZipFile(source) as package, zipfile.ZipFile(target, "w") as output:
-        names = package.namelist()
-        # The mimetype entry comes first and is stored uncompressed.
-        for name in sorted(names, key=lambda item: item != "mimetype"):
-            data = package.read(name)
-            if name in ("styles.xml", "content.xml"):
-                text, found = drop_fixed_pitch(data.decode("utf-8"))
-                changes.extend(found)
-                if name == "styles.xml":
-                    text, found = fill_grid(text)
-                    changes.extend(found)
-                data = text.encode("utf-8")
+        for name in sorted(package.namelist(), key=lambda item: item != "mimetype"):
+            data, found = edit(name, package.read(name))
+            changes.extend(found)
             compression = zipfile.ZIP_STORED if name == "mimetype" else zipfile.ZIP_DEFLATED
             output.writestr(zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0)), data, compress_type=compression)
     return changes
+
+
+def edit_package(source: pathlib.Path, target: pathlib.Path) -> list[str]:
+    """Writes `source` with the grid filled in and fixed pitches dropped to `target`."""
+
+    def edit(name: str, data: bytes) -> tuple[bytes, list[str]]:
+        if name not in ("styles.xml", "content.xml"):
+            return data, []
+        text, changes = drop_fixed_pitch(data.decode("utf-8"))
+        if name == "styles.xml":
+            text, found = fill_grid(text)
+            changes.extend(found)
+        return text.encode("utf-8"), changes
+
+    return rewrite_package(source, target, edit)
+
+
+def inject_settings(source: pathlib.Path, target: pathlib.Path) -> list[str]:
+    """Writes `source` with the compatibility settings to `target`.
+
+    This belongs on the final package: see `prepare`.
+    """
+
+    def edit(name: str, data: bytes) -> tuple[bytes, list[str]]:
+        if name != SETTINGS:
+            return data, []
+        text, changes = with_compat_settings(data.decode("utf-8"))
+        return text.encode("utf-8"), changes
+
+    with zipfile.ZipFile(source) as package:
+        if SETTINGS not in package.namelist():
+            raise RuntimeError(f"{source.name} has no {SETTINGS}")
+    return rewrite_package(source, target, edit)
 
 
 def resave(source: pathlib.Path, target: pathlib.Path, soffice: str) -> None:
@@ -150,6 +226,30 @@ def resave(source: pathlib.Path, target: pathlib.Path, soffice: str) -> None:
         shutil.copyfile(saved, target)
 
 
+def prepare(
+    source: pathlib.Path, target: pathlib.Path, resave: Callable[[pathlib.Path, pathlib.Path], None] | None = None
+) -> list[str]:
+    """Writes the prepared `source` to `target`: the package edit, then the
+    re-save when there is one, then the settings.
+
+    Neither step may move. A re-save rewrites `settings.xml` and writes
+    `AdjustTableLineHeightsToGridHeight` back as true, so the settings go into
+    the final package, after it. A re-save of a grid with no base height instead
+    freezes LibreOffice's own default -- a document whose pitch was 29.14pt came
+    back with `layout-grid-base-height="0.706cm"`, 20.01pt -- so the grid is
+    filled before it.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        final = pathlib.Path(directory) / "edited.odt"
+        changes = edit_package(source, final)
+        if resave is not None:
+            resaved = pathlib.Path(directory) / "resaved.odt"
+            resave(final, resaved)
+            final = resaved
+        changes.extend(inject_settings(final, target))
+    return changes
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("source", help=".odt exported by Microsoft Word")
@@ -157,14 +257,11 @@ def main() -> int:
     parser.add_argument("--soffice", default="soffice")
     parser.add_argument("--no-resave", action="store_true", help="only edit the package")
     arguments = parser.parse_args()
-    output = pathlib.Path(arguments.output)
-    with tempfile.TemporaryDirectory() as directory:
-        edited = pathlib.Path(directory) / "edited.odt"
-        changes = edit_package(pathlib.Path(arguments.source), edited)
-        if arguments.no_resave:
-            shutil.copyfile(edited, output)
-        else:
-            resave(edited, output, arguments.soffice)
+    changes = prepare(
+        pathlib.Path(arguments.source),
+        pathlib.Path(arguments.output),
+        None if arguments.no_resave else functools.partial(resave, soffice=arguments.soffice),
+    )
     print(json.dumps({"changes": changes, "resaved": not arguments.no_resave}, ensure_ascii=False, indent=2))
     return 0
 
