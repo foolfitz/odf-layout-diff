@@ -156,6 +156,30 @@ class PackageTests(unittest.TestCase):
                     self.assertEqual(info.compress_type, zipfile.ZIP_STORED)
 
 
+    def test_a_callback_that_puts_data_in_a_directory_entry_is_refused(self) -> None:
+        """The guard above drives `edit_package`, whose callback never touches a
+        directory entry, so what it proves is that an empty one stays empty --
+        not that `rewrite_package` cannot emit a payload-bearing one. It can: the
+        callback receives directory names too, and the return value was written
+        out unexamined (`file_size=1`, `payload=b'X'`), which a validator rejects
+        at the ZIP layer. No production callback does this today, so the defect
+        was latent; the invariant makes it loud instead.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = pathlib.Path(directory) / "lo.odt", pathlib.Path(directory) / "edited.odt"
+            with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as package:
+                package.writestr("mimetype", "application/vnd.oasis.opendocument.text")
+                package.writestr("content.xml", "<office:document-content/>")
+                package.writestr(zipfile.ZipInfo("Configurations2/"), b"")
+
+            def edit(name: str, data: bytes) -> tuple[bytes, list[str]]:
+                return (b"X", []) if name.endswith("/") else (data, [])
+
+            with self.assertRaises(RuntimeError) as refused:
+                prepare_word_odt.rewrite_package(source, target, edit)
+            self.assertIn("Configurations2/", str(refused.exception))
+
+
 class SettingsTests(unittest.TestCase):
     def test_a_self_closing_root_gains_the_namespace_and_the_item(self) -> None:
         edited, changes = prepare_word_odt.with_compat_settings(WORD_SETTINGS)
@@ -260,6 +284,37 @@ class PaddingTests(unittest.TestCase):
         """
         xml = '<style:paragraph-properties fo:margin-left="-1cm" fo:text-indent="-0.5cm"/>'
         self.assertEqual(prepare_word_odt.clamp_negative_padding(xml), (xml, []))
+
+    def test_an_attribute_whose_prefix_merely_ends_in_fo_is_left_alone(self) -> None:
+        """`xfo:` is a different prefix, so `xfo:padding` is a different attribute
+        and clamping it is corruption, not repair. The pattern used to match it
+        because it looked for the text `fo:padding` anywhere; it now requires the
+        name to start after whitespace, which is where an attribute name starts.
+        """
+        xml = '<style:graphic-properties xfo:padding="-1cm" xmlns:xfo="urn:example:xfo"/>'
+        self.assertEqual(prepare_word_odt.clamp_negative_padding(xml), (xml, []))
+
+    def test_a_padding_written_against_a_quote_inside_a_value_is_left_alone(self) -> None:
+        """A legal string value may contain the text of an attribute. Rewriting it
+        changes the document's data. The whitespace requirement stops the common
+        shape, where the value begins with the text.
+        """
+        xml = """<text:p office:string-value='fo:padding="-1cm"'/>"""
+        self.assertEqual(prepare_word_odt.clamp_negative_padding(xml), (xml, []))
+
+    def test_a_padding_inside_a_value_after_a_space_is_still_clamped(self) -> None:
+        """KNOWN GAP, pinned on purpose. Whitespace is a proxy for "an attribute
+        name starts here", and a string value whose text happens to contain
+        ` fo:padding="-1cm"` still satisfies it. Telling the two apart needs a
+        parser, which is deliberately out of scope here -- see
+        `clamp_negative_padding`'s docstring. If this test ever goes red because
+        the clamp became XML-aware, that is the fix landing, not a regression:
+        update the docstring and this test together.
+        """
+        xml = """<text:p office:string-value='x fo:padding="-1cm"'/>"""
+        clamped, changes = prepare_word_odt.clamp_negative_padding(xml)
+        self.assertEqual(clamped, """<text:p office:string-value='x fo:padding="0cm"'/>""")
+        self.assertEqual(changes, ["1 negative paddings clamped to 0"])
 
     def test_a_padding_that_is_already_valid_is_untouched(self) -> None:
         xml = '<style:graphic-properties fo:padding-top="0.2cm" fo:padding="0cm"/>'

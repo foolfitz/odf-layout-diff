@@ -170,7 +170,7 @@ def with_compat_settings(settings: str) -> tuple[str, list[str]]:
     return with_items(settings, COMPAT_ITEMS), changes
 
 
-NEGATIVE_PADDING = re.compile(r'(fo:padding(?:-(?:top|bottom|left|right))?)="-[^"]*"')
+NEGATIVE_PADDING = re.compile(r'(?<=\s)(fo:padding(?:-(?:top|bottom|left|right))?)="-[^"]*"')
 
 
 def clamp_negative_padding(xml: str) -> tuple[str, list[str]]:
@@ -186,25 +186,31 @@ def clamp_negative_padding(xml: str) -> tuple[str, list[str]]:
     `fo:margin-right` are plain `length` where a negative value is legal and
     load-bearing for the layout this pipeline exists to preserve.
 
-    KNOWN WRONG IN TWO DIRECTIONS -- an adversarial review on 2026-09-16 showed
-    both, and each was reproduced here before being written down:
+    The name has to start after whitespace, which is where an attribute name
+    starts in a start tag. That requirement is what keeps two legal constructs
+    out of reach: `xfo:padding`, an unrelated attribute whose prefix merely ends
+    in `fo`, and a value that opens with the text of an attribute, such as
+    `office:string-value='fo:padding="-1cm"'`. Both were reproduced as
+    corruption by an adversarial review on 2026-09-16 before it was added.
 
-    * It matches raw text, not XML, so it rewrites a negative padding that
-      appears inside a legal attribute *value*, for example
-      `office:string-value='fo:padding="-1cm"'`, and it rewrites an unrelated
-      attribute whose prefix merely ends in `fo`, such as `xfo:padding`. That
-      is corruption of valid data, not repair.
+    STILL INCOMPLETE, AND DELIBERATELY SO. This matches raw text, and every gap
+    left needs a parser rather than a wider pattern. Each was reproduced here:
+
+    * Whitespace is only a proxy for "an attribute name begins here". A string
+      value whose text contains ` fo:padding="-1cm"` after a space is still
+      rewritten; the tests pin that as a known gap rather than hide it.
     * It misses `x:padding` (a different prefix bound to the same namespace),
       single-quoted values, whitespace around the `=`, and `&#45;` written as a
       character reference -- all of which the validator rejects.
+    * It is narrower than the defect class: `fo:margin-top`, `fo:margin-bottom`,
+      the `fo:margin` shorthand and `fo:line-height` are `nonNegativeLength` too
+      (checked against the ODF 1.4 RNG), so a negative value there is equally
+      invalid and goes unclamped.
 
-    It is also narrower than the defect class: `fo:margin-top`,
-    `fo:margin-bottom`, the `fo:margin` shorthand and `fo:line-height` are
-    `nonNegativeLength` too (checked against the ODF 1.4 RNG), so a negative
-    value there is equally invalid and is not clamped.
-
-    Fixing this properly means parsing the XML and resolving prefixes rather
-    than widening the pattern; that is a design decision, not a patch.
+    Closing those means resolving prefixes and refusing to match inside a value,
+    which is parsing. The decision taken on 2026-09-16 was to stop the corruption
+    here and leave the correct version to the repair operation that will own it,
+    where parsing is already how the document is read.
     """
     clamped, count = NEGATIVE_PADDING.subn(r'\1="0cm"', xml)
     return clamped, [f"{count} negative paddings clamped to 0"] if count else []
@@ -219,6 +225,13 @@ def rewrite_package(
         for name in sorted(package.namelist(), key=lambda item: item != "mimetype"):
             data, found = edit(name, package.read(name))
             changes.extend(found)
+            if name.endswith("/") and data:
+                # The callback is handed directory names too, and its return value
+                # used to be written out unexamined. Storing it would not save the
+                # package: an entry with a payload is rejected at the ZIP layer
+                # whatever its compression. No callback here does this, so this
+                # fails closed on a defect that is latent rather than silent.
+                raise RuntimeError(f"{name}: a directory entry cannot carry data ({len(data)} bytes)")
             # A directory entry is empty, and deflating it would give it a payload
             # that a validator rejects at the ZIP layer -- hiding every diagnostic
             # behind it. It is stored, like the mimetype, for that reason.
