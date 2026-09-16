@@ -60,7 +60,9 @@ class PrepareTests(unittest.TestCase):
         self.assertIn(OTHER_ITEM, settings)
 
     def test_a_document_without_a_grid_is_left_alone(self) -> None:
-        # The option does nothing without a grid, so nothing is rewritten.
+        # The option does nothing without a grid, so no part is edited. The
+        # package is still rewritten on the way through the clamp, so this
+        # compares the parts, not the bytes of the container.
         settings = office_settings(OTHER_ITEM)
         changes, prepared = self.prepare(NO_GRID, settings)
         self.assertEqual(changes, [])
@@ -81,6 +83,34 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(changes, [f"settings.xml: {ADJUST}=false"])
         self.assertEqual(prepared["styles.xml"].decode(), styles)
         self.assertEqual(prepared["content.xml"].decode(), content)
+
+    def test_a_negative_padding_is_clamped_here_too(self) -> None:
+        content = (
+            "<office:document-content>"
+            '<style:graphic-properties fo:padding-top="-0.004cm"/>'
+            "</office:document-content>"
+        )
+        changes, prepared = self.prepare(GRID, office_settings(OTHER_ITEM), content)
+        self.assertIn('fo:padding-top="0cm"', prepared["content.xml"].decode())
+        self.assertIn("content.xml: 1 negative paddings clamped to 0", changes)
+
+    def test_a_negative_padding_is_clamped_without_a_grid(self) -> None:
+        """The clamp is not gated on the grid, and not on a re-save either.
+
+        A converted document with no grid has nothing for the settings item to
+        act on, but an invalid padding still stops anything that validates a
+        document before editing it. Two documents in the corpus carry one as
+        authored, with no re-save anywhere in their history -- so gating the
+        clamp on either condition would miss exactly those.
+        """
+        content = (
+            "<office:document-content>"
+            '<style:graphic-properties fo:padding="-1pt"/>'
+            "</office:document-content>"
+        )
+        changes, prepared = self.prepare(NO_GRID, office_settings(OTHER_ITEM), content)
+        self.assertIn('fo:padding="0cm"', prepared["content.xml"].decode())
+        self.assertEqual(changes, ["content.xml: 1 negative paddings clamped to 0"])
 
 
 def parts_of(styles: str, settings: str) -> dict[str, bytes]:

@@ -75,7 +75,9 @@ def build(r, variant, dst):
                 d = t.encode('utf-8')
             elif n == 'settings.xml' and VARIANTS[variant]:
                 d = with_items(d.decode('utf-8'), VARIANTS[variant]).encode('utf-8')
-            zo.writestr(zipfile.ZipInfo(n, (1980, 1, 1, 0, 0, 0)), d, zipfile.ZIP_STORED if n == 'mimetype' else zipfile.ZIP_DEFLATED)
+            # Directory entries are stored, not deflated: see prepare_word_odt.rewrite_package.
+            zo.writestr(zipfile.ZipInfo(n, (1980, 1, 1, 0, 0, 0)), d,
+                        zipfile.ZIP_STORED if (n == 'mimetype' or n.endswith('/')) else zipfile.ZIP_DEFLATED)
 
 def soffice(profile, outdir, files, timeout):
     p = subprocess.Popen([SOFFICE, f'-env:UserInstallation=file://{profile}', '--headless', '--convert-to', 'pdf', '--outdir', str(outdir)] + [str(f) for f in files],

@@ -21,13 +21,17 @@ touch font pitch: those are defects of that export, and these documents carry a
 base height and a usable font pitch already. There is no re-save either -- the
 package these tools write is already one LibreOffice reads back unchanged.
 
+What it does share with the Word path is the padding clamp: a negative
+`fo:padding` is invalid whatever wrote it, and a handful of these documents
+carry one as authored.
+
     python3 experiments/prepare_converter_odt.py converted.odt prepared.odt
 """
 import argparse
 import json
 import pathlib
-import shutil
 import sys
+import tempfile
 import zipfile
 
 try:
@@ -47,14 +51,23 @@ def has_grid(styles: str) -> bool:
 
 
 def prepare(source: pathlib.Path, target: pathlib.Path) -> list[str]:
-    """Writes `source` with the compatibility settings to `target`, or copies it
-    when it has no grid for them to act on."""
+    """Writes `source` to `target` with the negative paddings clamped, and with
+    the compatibility settings when there is a grid for them to act on.
+
+    The clamp is not conditional on the grid. An invalid padding stops anything
+    that validates a document before editing it, whatever the grid says, and
+    these documents never went through a re-save -- what they carry is what
+    their converter wrote.
+    """
     with zipfile.ZipFile(source) as package:
         styles = package.read(STYLES).decode("utf-8") if STYLES in package.namelist() else ""
     if not has_grid(styles):
-        shutil.copyfile(source, target)
-        return []
-    return prepare_word_odt.inject_settings(source, target)
+        return prepare_word_odt.clamp_padding(source, target)
+    with tempfile.TemporaryDirectory() as directory:
+        clamped = pathlib.Path(directory) / "clamped.odt"
+        changes = prepare_word_odt.clamp_padding(source, clamped)
+        changes.extend(prepare_word_odt.inject_settings(clamped, target))
+    return changes
 
 
 def main() -> int:

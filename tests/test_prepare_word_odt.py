@@ -131,6 +131,30 @@ class PackageTests(unittest.TestCase):
                 self.assertIn("layout-grid-base-height", package.read("styles.xml").decode())
             self.assertEqual(len(changes), 1)
 
+    def test_a_directory_entry_comes_out_without_a_payload(self) -> None:
+        """A LibreOffice-written package carries `Configurations2/` as an empty,
+        stored directory entry. Deflating it on the way out gives it a two-byte
+        payload, and a validator then rejects the package at the ZIP layer --
+        before a single byte of its content is looked at, so every real
+        diagnostic disappears behind that one. Measured on a re-saved document:
+        169 diagnostics (77 under extended conformance) collapsed to 1.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = pathlib.Path(directory) / "lo.odt", pathlib.Path(directory) / "edited.odt"
+            with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as package:
+                package.writestr("mimetype", "application/vnd.oasis.opendocument.text")
+                package.writestr("content.xml", "<office:document-content/>")
+                package.writestr("styles.xml", page_layout(WORD_GRID))
+                package.writestr(zipfile.ZipInfo("Configurations2/"), b"")
+            prepare_word_odt.edit_package(source, target)
+            with zipfile.ZipFile(target) as package:
+                directories = [info for info in package.infolist() if info.filename.endswith("/")]
+                self.assertEqual([info.filename for info in directories], ["Configurations2/"])
+                for info in directories:
+                    self.assertEqual(info.file_size, 0)
+                    self.assertEqual(info.compress_size, 0)
+                    self.assertEqual(info.compress_type, zipfile.ZIP_STORED)
+
 
 class SettingsTests(unittest.TestCase):
     def test_a_self_closing_root_gains_the_namespace_and_the_item(self) -> None:
@@ -198,6 +222,77 @@ class OrderTests(unittest.TestCase):
                 self.assertIn("layout-grid-base-height", package.read("styles.xml").decode())
         self.assertIn(item(ADJUST, "false"), settings)
         self.assertIn('xmlns:ooo="http://openoffice.org/2004/office"', settings)
+
+
+class PaddingTests(unittest.TestCase):
+    """A re-save writes `fo:padding-*="-0.004cm"`. The ODF type is a non-negative
+    length, so the document is rejected and nothing that validates its source can
+    act on it. Measured on one re-saved document: 76 such attributes on 19
+    `style:graphic-properties`, all in content.xml, and no other `fo:*` attribute
+    in the file carried a negative value.
+    """
+
+    def test_a_negative_padding_is_clamped_to_zero(self) -> None:
+        xml = (
+            '<style:graphic-properties fo:padding-top="-0.004cm" fo:padding-left="-0.009cm"/>'
+            '<style:table-cell-properties fo:padding="-1pt"/>'
+        )
+        clamped, changes = prepare_word_odt.clamp_negative_padding(xml)
+        self.assertEqual(
+            clamped,
+            '<style:graphic-properties fo:padding-top="0cm" fo:padding-left="0cm"/>'
+            '<style:table-cell-properties fo:padding="0cm"/>',
+        )
+        self.assertEqual(changes, ["3 negative paddings clamped to 0"])
+
+    def test_a_negative_margin_is_left_alone(self) -> None:
+        """`fo:margin-left` is a plain `length`: a negative value is legal there,
+        and clamping it would change the layout this whole pipeline exists to
+        keep. No real document in the corpus carries one, so this witness is
+        synthetic on purpose -- without it the test above only shows the clamp
+        fires, never that it stops where it should.
+
+        It shows that only for the horizontal case. `fo:margin-top`,
+        `fo:margin-bottom` and the `fo:margin` shorthand are `nonNegativeLength`
+        (checked against the ODF 1.4 RNG), so a negative value there is invalid
+        and simply goes unclamped -- see `clamp_negative_padding`'s docstring for
+        that and the other known gaps.
+        """
+        xml = '<style:paragraph-properties fo:margin-left="-1cm" fo:text-indent="-0.5cm"/>'
+        self.assertEqual(prepare_word_odt.clamp_negative_padding(xml), (xml, []))
+
+    def test_a_padding_that_is_already_valid_is_untouched(self) -> None:
+        xml = '<style:graphic-properties fo:padding-top="0.2cm" fo:padding="0cm"/>'
+        self.assertEqual(prepare_word_odt.clamp_negative_padding(xml), (xml, []))
+
+
+class PaddingOrderTests(unittest.TestCase):
+    def test_the_padding_is_clamped_in_the_package_the_resave_produced(self) -> None:
+        """The negative values do not come from Word -- LibreOffice writes them on
+        the way out. Clamping before the re-save would therefore clamp nothing.
+        """
+
+        def resave(source: pathlib.Path, target: pathlib.Path) -> None:
+            with zipfile.ZipFile(source) as package:
+                parts = {name: package.read(name) for name in package.namelist()}
+            parts["content.xml"] = (
+                '<office:document-content>'
+                '<style:graphic-properties fo:padding-top="-0.004cm"/>'
+                "</office:document-content>"
+            ).encode("utf-8")
+            with zipfile.ZipFile(target, "w") as output:
+                for name, data in parts.items():
+                    output.writestr(name, data)
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = pathlib.Path(directory) / "word.odt", pathlib.Path(directory) / "prepared.odt"
+            word_package(source)
+            changes = prepare_word_odt.prepare(source, target, resave)
+            with zipfile.ZipFile(target) as package:
+                content = package.read("content.xml").decode()
+        self.assertIn('fo:padding-top="0cm"', content)
+        self.assertNotIn("-0.004cm", content)
+        self.assertIn("content.xml: 1 negative paddings clamped to 0", changes)
 
 
 if __name__ == "__main__":

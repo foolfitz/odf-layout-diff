@@ -170,6 +170,46 @@ def with_compat_settings(settings: str) -> tuple[str, list[str]]:
     return with_items(settings, COMPAT_ITEMS), changes
 
 
+NEGATIVE_PADDING = re.compile(r'(fo:padding(?:-(?:top|bottom|left|right))?)="-[^"]*"')
+
+
+def clamp_negative_padding(xml: str) -> tuple[str, list[str]]:
+    """Replaces negative `fo:padding*` values with `0cm`.
+
+    A re-save writes `fo:padding-*="-0.004cm"`, but the ODF type here is a
+    non-negative length, so the document does not validate and anything that
+    checks its source before editing it refuses to proceed. Measured on one
+    re-saved document: 76 such attributes on 19 `style:graphic-properties`.
+
+    Only padding is clamped, and the four sides and the shorthand are named one
+    by one rather than matched by a prefix, because `fo:margin-left` and
+    `fo:margin-right` are plain `length` where a negative value is legal and
+    load-bearing for the layout this pipeline exists to preserve.
+
+    KNOWN WRONG IN TWO DIRECTIONS -- an adversarial review on 2026-09-16 showed
+    both, and each was reproduced here before being written down:
+
+    * It matches raw text, not XML, so it rewrites a negative padding that
+      appears inside a legal attribute *value*, for example
+      `office:string-value='fo:padding="-1cm"'`, and it rewrites an unrelated
+      attribute whose prefix merely ends in `fo`, such as `xfo:padding`. That
+      is corruption of valid data, not repair.
+    * It misses `x:padding` (a different prefix bound to the same namespace),
+      single-quoted values, whitespace around the `=`, and `&#45;` written as a
+      character reference -- all of which the validator rejects.
+
+    It is also narrower than the defect class: `fo:margin-top`,
+    `fo:margin-bottom`, the `fo:margin` shorthand and `fo:line-height` are
+    `nonNegativeLength` too (checked against the ODF 1.4 RNG), so a negative
+    value there is equally invalid and is not clamped.
+
+    Fixing this properly means parsing the XML and resolving prefixes rather
+    than widening the pattern; that is a design decision, not a patch.
+    """
+    clamped, count = NEGATIVE_PADDING.subn(r'\1="0cm"', xml)
+    return clamped, [f"{count} negative paddings clamped to 0"] if count else []
+
+
 def rewrite_package(
     source: pathlib.Path, target: pathlib.Path, edit: Callable[[str, bytes], tuple[bytes, list[str]]]
 ) -> list[str]:
@@ -179,7 +219,11 @@ def rewrite_package(
         for name in sorted(package.namelist(), key=lambda item: item != "mimetype"):
             data, found = edit(name, package.read(name))
             changes.extend(found)
-            compression = zipfile.ZIP_STORED if name == "mimetype" else zipfile.ZIP_DEFLATED
+            # A directory entry is empty, and deflating it would give it a payload
+            # that a validator rejects at the ZIP layer -- hiding every diagnostic
+            # behind it. It is stored, like the mimetype, for that reason.
+            stored = name == "mimetype" or name.endswith("/")
+            compression = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
             output.writestr(zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0)), data, compress_type=compression)
     return changes
 
@@ -217,6 +261,24 @@ def inject_settings(source: pathlib.Path, target: pathlib.Path) -> list[str]:
     return rewrite_package(source, target, edit)
 
 
+def clamp_padding(source: pathlib.Path, target: pathlib.Path) -> list[str]:
+    """Writes `source` with every negative padding clamped to `target`.
+
+    This belongs on the package a re-save produced: the negative values are
+    LibreOffice's, not Word's, so clamping before it would clamp nothing. Both
+    parts are covered because padding is legal in either, even though the
+    document this was measured on carried all 76 of them in content.xml.
+    """
+
+    def edit(name: str, data: bytes) -> tuple[bytes, list[str]]:
+        if name not in ("styles.xml", "content.xml"):
+            return data, []
+        text, changes = clamp_negative_padding(data.decode("utf-8"))
+        return text.encode("utf-8"), [f"{name}: {change}" for change in changes]
+
+    return rewrite_package(source, target, edit)
+
+
 def resave(source: pathlib.Path, target: pathlib.Path, soffice: str) -> None:
     with tempfile.TemporaryDirectory() as directory:
         outdir = pathlib.Path(directory)
@@ -236,14 +298,21 @@ def prepare(
     source: pathlib.Path, target: pathlib.Path, resave: Callable[[pathlib.Path, pathlib.Path], None] | None = None
 ) -> list[str]:
     """Writes the prepared `source` to `target`: the package edit, then the
-    re-save when there is one, then the settings.
+    re-save when there is one, then the padding clamp, then the settings.
 
-    Neither step may move. A re-save rewrites `settings.xml` and writes
-    `AdjustTableLineHeightsToGridHeight` back as true, so the settings go into
-    the final package, after it. A re-save of a grid with no base height instead
-    freezes LibreOffice's own default -- a document whose pitch was 29.14pt came
-    back with `layout-grid-base-height="0.706cm"`, 20.01pt -- so the grid is
-    filled before it.
+    No step may move, and each is pinned by a test:
+
+    * The grid is filled **before** the re-save. A re-save of a grid with no
+      base height freezes LibreOffice's own default instead -- a document whose
+      pitch was 29.14pt came back with `layout-grid-base-height="0.706cm"`,
+      20.01pt.
+    * The padding is clamped **after** the re-save, because the negative values
+      are written by that re-save and do not exist before it.
+    * The settings go in **last**, because a re-save rewrites `settings.xml`
+      and puts `AdjustTableLineHeightsToGridHeight` back as true.
+
+    The clamp runs whether or not there was a re-save: a handful of documents
+    in the corpus already carry a negative padding as authored.
     """
     with tempfile.TemporaryDirectory() as directory:
         final = pathlib.Path(directory) / "edited.odt"
@@ -252,6 +321,9 @@ def prepare(
             resaved = pathlib.Path(directory) / "resaved.odt"
             resave(final, resaved)
             final = resaved
+        clamped = pathlib.Path(directory) / "clamped.odt"
+        changes.extend(clamp_padding(final, clamped))
+        final = clamped
         changes.extend(inject_settings(final, target))
     return changes
 

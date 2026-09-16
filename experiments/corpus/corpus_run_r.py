@@ -30,7 +30,9 @@ def rezip(src, dst, edit):
     with zipfile.ZipFile(src) as zi, zipfile.ZipFile(dst, 'w') as zo:
         for n in sorted(zi.namelist(), key=lambda x: x != 'mimetype'):
             d = edit(n, zi.read(n))
-            zo.writestr(zipfile.ZipInfo(n, (1980, 1, 1, 0, 0, 0)), d, zipfile.ZIP_STORED if n == 'mimetype' else zipfile.ZIP_DEFLATED)
+            # Directory entries are stored, not deflated: see prepare_word_odt.rewrite_package.
+            zo.writestr(zipfile.ZipInfo(n, (1980, 1, 1, 0, 0, 0)), d,
+                        zipfile.ZIP_STORED if (n == 'mimetype' or n.endswith('/')) else zipfile.ZIP_DEFLATED)
 def pre(n, d):
     if n in ('styles.xml', 'content.xml'):
         t = drop_fixed_pitch(d.decode('utf-8'))[0]
