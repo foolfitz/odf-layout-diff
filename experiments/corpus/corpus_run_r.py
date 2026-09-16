@@ -15,6 +15,12 @@ import json, os, re, signal, subprocess, sys, zipfile, pathlib, concurrent.futur
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent)); sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from prepare_word_odt import fill_grid, drop_fixed_pitch
 from inject import with_items
+
+# Resolved once, never guessed: see corpus_run.py for why.
+SOFFICE = os.environ.get('SOFFICE') or shutil.which('soffice')
+if not SOFFICE or not os.path.isfile(SOFFICE):
+    raise SystemExit(f'soffice not found ({SOFFICE or "not on PATH"}): set $SOFFICE or put it on PATH')
+
 SP = pathlib.Path(sys.argv[1]); WORKERS = 4; WORK = SP / 'corpus' / 'c1r'; WORK.mkdir(parents=True, exist_ok=True)
 rows = json.load(open(SP / 'corpus' / 'population.json'))
 sel = [dict(r, idx=i) for i, r in enumerate(rows) if r['fam'] == 'word' and r['pages']]
@@ -32,7 +38,7 @@ def pre(n, d):
         return t.encode('utf-8')
     return d
 def soffice(profile, fmt, outdir, files, timeout):
-    p = subprocess.Popen(['/usr/bin/soffice', f'-env:UserInstallation=file://{profile}', '--headless', '--convert-to', fmt, '--outdir', str(outdir)] + [str(f) for f in files],
+    p = subprocess.Popen([SOFFICE, f'-env:UserInstallation=file://{profile}', '--headless', '--convert-to', fmt, '--outdir', str(outdir)] + [str(f) for f in files],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     try: p.wait(timeout=timeout)
     except subprocess.TimeoutExpired: os.killpg(p.pid, signal.SIGKILL); p.wait()

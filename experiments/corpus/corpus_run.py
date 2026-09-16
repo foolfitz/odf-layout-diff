@@ -22,9 +22,16 @@ C2  population: ODTs saved by MODA/NDC ODF tools or LibreOffice that carry Word-
               v2gm (+MsWordCompGridMetrics=true), v3both (both).
 Counting object: one document x variant -> rendered page count (pdfinfo) or an error.
 """
-import json, os, re, signal, subprocess, sys, zipfile, random, pathlib, concurrent.futures
+import json, os, re, shutil, signal, subprocess, sys, zipfile, random, pathlib, concurrent.futures
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent)); sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from prepare_word_odt import fill_grid, drop_fixed_pitch
+
+# The renderer is the oracle for every page count below, so it is resolved once,
+# up front, and never guessed: $SOFFICE wins, otherwise whatever is on PATH.
+# A missing binary stops the run here rather than after the corpus was built.
+SOFFICE = os.environ.get('SOFFICE') or shutil.which('soffice')
+if not SOFFICE or not os.path.isfile(SOFFICE):
+    raise SystemExit(f'soffice not found ({SOFFICE or "not on PATH"}): set $SOFFICE or put it on PATH')
 
 SP = pathlib.Path(sys.argv[1]); EXP = sys.argv[2]; WORKERS = 4
 WORK = SP / 'corpus' / EXP; WORK.mkdir(parents=True, exist_ok=True)
@@ -71,7 +78,7 @@ def build(r, variant, dst):
             zo.writestr(zipfile.ZipInfo(n, (1980, 1, 1, 0, 0, 0)), d, zipfile.ZIP_STORED if n == 'mimetype' else zipfile.ZIP_DEFLATED)
 
 def soffice(profile, outdir, files, timeout):
-    p = subprocess.Popen(['/usr/bin/soffice', f'-env:UserInstallation=file://{profile}', '--headless', '--convert-to', 'pdf', '--outdir', str(outdir)] + [str(f) for f in files],
+    p = subprocess.Popen([SOFFICE, f'-env:UserInstallation=file://{profile}', '--headless', '--convert-to', 'pdf', '--outdir', str(outdir)] + [str(f) for f in files],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     try: p.wait(timeout=timeout); return True
     except subprocess.TimeoutExpired:
