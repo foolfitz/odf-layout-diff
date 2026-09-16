@@ -1,3 +1,9 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright 2026 OSSII
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
 import re
 BLOCK = re.compile(r'<config:config-item-set config:name="ooo:configuration-settings">.*</config:config-item-set>(?=\s*</office:settings>)', re.S)
 def with_items(xml, items):

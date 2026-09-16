@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MPL-2.0
+# Copyright 2026 OSSII
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
 """C1r (pre-registered): C1 population (Word-exported ODT with meta page count = Word's layout).
 Base = non-ASCII fixed pitch dropped + text grid filled, then saved once by LibreOffice 26.2
 (its settings.xml is complete; compat items injected into Word's minimal settings.xml are ignored).

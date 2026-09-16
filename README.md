@@ -192,3 +192,9 @@ python3 -m unittest discover -s tests -t . -v
 - Line breaks before text too short to align (for example a lone "日"
   wrapped onto the next line) are not found as breaks; the resulting shift
   is reported with the added row in `extraRows` instead.
+
+## License
+
+Copyright 2026 OSSII. Licensed under the Mozilla Public License, Version 2.0;
+see [LICENSE](LICENSE). New files carry an `SPDX-License-Identifier: MPL-2.0`
+header.
